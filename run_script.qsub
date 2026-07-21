@@ -1,0 +1,98 @@
+#!/bin/bash
+#PBS -N Chopper_Minibar
+#PBS -P vz35
+#PBS -l wd
+#PBS -m e
+#PBS -M ziyan.zhang@anu.edu.au
+#PBS -l ncpus=2
+#PBS -l mem=10GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=20:00:00
+#PBS -l storage=gdata/vz35
+#PBS -q biodev
+
+#--------README---------------------------------------------------------------
+# Slim wrapper around the Python core pipeline.
+#   Pre-step: generate_primer_setup.py  -> ITS_primer_setup_<date>.txt
+#   Core:     filter_chopper_demux_minibar.py
+#               Step 1 - Chopper filter (Q + length window set in Variables)
+#               Step 2 - Minibar demultiplex (-l 200 -M 2, set in the Python;
+#                        -M 2 is required by the combinatorial index layout)
+#               Step 3 - Organise reads by client + write summaries
+#-----------------------------------------------------------------------------
+
+set -euo pipefail
+
+#--------Module---------------------------------------------------------------
+module load python3/3.12.1
+
+date_stamp=$(date +%Y%m%d)
+
+#--------Variables (edit per run)---------------------------------------------
+# run name under /g/data/vz35/PromethION_data/sequencer_uploads/
+run_name=ONT_ITS_20260422
+
+# sample sheet CSV (columns: Client, Sample_ID, Barcode; Barcode = ITS01-ITS96)
+samplesheet=/g/data/vz35/ONT_ITS_workflow/sample_sheet/its_samplesheet.csv
+
+# run output (will hold integrated_demultiplexing/ + read_counts_summary.txt)
+output_dir=/g/data/vz35/ONT_ITS_workflow/minibar_output/ONT_ITS_TBC_${date_stamp}
+
+# Chopper read filtering. The length window must bracket the expected amplicon
+# for the primer pair in use, so re-check it whenever the primers change.
+#   ITS (ITS1F/ITS4): main peak ~0.78-0.80 kb, shoulder ~0.60-0.70 kb,
+#                     concatemers/junk above ~1.5 kb  -> 400-1200
+#   full-length 16S:  ~1.5 kb                         -> 1000-2000
+min_quality=15
+min_length=400
+max_length=1200
+
+#--------DONT-CHANGE----------------------------------------------------------
+_root=/g/data/vz35/PromethION_data/sequencer_uploads
+mapfile -t _fq_dirs < <(find "${_root}/${run_name}" -type d -name "fastq_pass")
+if [[ ${#_fq_dirs[@]} -eq 0 ]]; then
+    echo "ERROR: fastq_pass not found under ${_root}/${run_name}" >&2
+    exit 1
+elif [[ ${#_fq_dirs[@]} -gt 1 ]]; then
+    echo "ERROR: multiple fastq_pass directories found under ${_root}/${run_name}:" >&2
+    printf '  %s\n' "${_fq_dirs[@]}" >&2
+    exit 1
+fi
+raw_input_dir="${_fq_dirs[0]}"
+
+tools_dir=/g/data/vz35/ONT_ITS_workflow/tools/brf_ont_ITS_workflow/
+generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to location
+core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
+
+primer_output_dir=/g/data/vz35/ONT_ITS_workflow/sample_sheet
+primer_file="${primer_output_dir}/ITS_primer_setup_${date_stamp}.txt"
+
+mkdir -p "$output_dir"
+
+#=============================================================================
+# PRE-STEP: Generate primer setup file
+#=============================================================================
+echo "========================================"
+echo " PRE-STEP: Generating primer setup: $(date)"
+echo "========================================"
+echo " Samplesheet: $samplesheet"
+
+python3 "$generate_primer_script" \
+    "$samplesheet" \
+    -o "$primer_output_dir" \
+    --date "$date_stamp"
+
+echo " Primer file: $primer_file"
+echo "========================================"
+
+#=============================================================================
+# CORE: Chopper filter -> Minibar demux -> organise by client
+#=============================================================================
+python3 "$core_script" \
+    --raw-input-dir "$raw_input_dir" \
+    --output-dir    "$output_dir" \
+    --primer-file   "$primer_file" \
+    --samplesheet   "$samplesheet" \
+    --min-quality   "$min_quality" \
+    --min-length    "$min_length" \
+    --max-length    "$max_length"

@@ -1,0 +1,6 @@
+bin
+utils/__pycache__
+16S_workflow/
+Filter_Chopper_Demux_Minibar.qsub/
+.vscode/
+Primer/
