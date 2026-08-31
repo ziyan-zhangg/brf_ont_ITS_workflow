@@ -9,7 +9,10 @@ Pipeline:
              set by --min-length/--max-length (defaults 400-1200 bp, sized
              for ITS; set these per primer pair from the qsub wrapper)
     Step 2 - Minibar:    demultiplex each filtered file but keep the primer
-             usage: python3 minibar.py -e 1 -E 5 -l 200 -M 2 -F
+             usage: python3 minibar.py -e E -E P -l 200 -M 2 -F
+             -e/-E come from --barcode-mismatch/--primer-mismatch (set in the
+             qsub wrapper); -l/-M/-F are fixed here. Minibar reads the
+             *_minibar primer setup file (tail+index only), not the cutadapt one.
     Step 2.5 - Cutadapt: two-pass per-sample orientation + 5'/3' primer trim
              Pass 1: -g FWD --revcomp --rename={header} --discard-untrimmed
              Pass 2: -a REV_RC  (tolerant; keeps truncated reads)
@@ -27,10 +30,13 @@ Usage:
         --raw-input-dir   /path/to/fastq_pass \\
         --output-dir      /path/to/run_output \\
         --primer-file     /path/to/ITS_primer_setup_YYYYMMDD.txt \\
+        --minibar-primer-file /path/to/ITS_primer_setup_minibar_YYYYMMDD.txt \\
         --samplesheet     /path/to/its_samplesheet.csv \\
         [--chopper /path/to/chopper] \\
         [--minibar  /path/to/minibar.py] \\
-        [--min-quality 15] [--min-length 400] [--max-length 1200]
+        [--cutadapt /path/to/cutadapt] \\
+        [--min-quality 15] [--min-length 400] [--max-length 1200] \\
+        [--barcode-mismatch 1] [--primer-mismatch 9]
 """
 
 from __future__ import annotations
@@ -197,12 +203,35 @@ def run_minibar(
     output_dir: Path,
     primer_file: Path,
     minibar_prog: Path,
+    barcode_mismatch: int = 1,   # NEW — default preserves current behaviour exactly
+    primer_mismatch: int = 5,
 ) -> list[Path]:
     """
     Run minibar on each filtered file in its own subdirectory.
 
     Equivalent to:
-        cd OUTDIR/<base> && python3 minibar.py -e 1 -E 5 -l 200 -M 2 -T -F PRIMER IN
+        cd OUTDIR/<base> && python3 minibar.py -e N -E N -l 200 -M 2 -T -F PRIMER IN
+
+    barcode_mismatch sets minibar's -e (allowed edit distance when matching the
+    barcode index). The IDT ITS FwIndex set has a minimum pairwise Hamming
+    distance of 3 (F1 vs F11), vs 5 for RvIndex — raising -e beyond 1 is expected
+    to both rescue some unk reads AND grow Multiple_Matches (widening tolerance
+    can only add candidate matches, never remove them). Watch whether
+    Multiple_Matches growth concentrates on the known close pairs: F1/F11,
+    F1/F10, F3/F9, F6/F8, F8/F10, F9/F12, F10/F11 (all distance <=4).
+    Tested 20260722: keep it at 1.
+
+    primer_mismatch sets minibar's -E (allowed edit distance when matching the
+    primer). The wrapper passes 9, which dates from when minibar matched against
+    the full construct: the fungal ITS primers (e.g. ITS1F/ITS4) carry
+    IUPAC-degenerate positions, minibar scores each such position against a
+    single concrete base, and every degenerate site was therefore counted as a
+    mismatch before any real sequencing error — so the budget was partly spent on
+    primer design rather than read quality. Minibar now reads the *_minibar
+    primer setup file, whose FwPrimer/RvPrimer stop after the Illumina tail +
+    10 bp index and contain no degenerate bases, so the headroom matters much
+    less (tested 20260722: -E 5 and -E 9 gave identical results). Re-check
+    whenever the primers or the minibar barcode reference change.
 
     -M 2 (require a barcode match at BOTH ends) is load-bearing for the ITS
     layout, not just a stringency preference. The IDT ITS 96 set is
@@ -213,8 +242,9 @@ def run_minibar(
     reads between samples rather than binning them as unknown.
 
     -l 200 is the window searched at each read end. It must stay comfortably
-    above the length of the barcoded construct (~52 bp: Illumina tail + 10 bp
-    index + primer), which it is; leaving headroom matters because ONT reads
+    above the length of what minibar is asked to match — ~32 bp in the *_minibar
+    reference (22 bp Illumina tail + 10 bp index), ~52 bp if the full construct
+    is used instead — which it is; leaving headroom matters because ONT reads
     often carry a few bases of noise before the adapter starts.
     """
     log("")
@@ -237,8 +267,8 @@ def run_minibar(
 
         cmd = [
             sys.executable, str(minibar_prog),
-            "-e", "1",
-            "-E", "5",
+            "-e", str(barcode_mismatch),
+            "-E", str(primer_mismatch),
             "-l", "200",
             "-M", "2",
             "-F",
@@ -246,6 +276,7 @@ def run_minibar(
             str(input_file),
         ]
         # minibar writes per-sample fastqs into its current working directory
+        log(f"  Cmd:    {' '.join(cmd)}")
         rc = subprocess.call(cmd, cwd=outd)
         if rc != 0:
             sys.exit(f"ERROR: minibar failed on {input_file} (exit {rc})")
@@ -514,7 +545,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", type=Path, required=True,
                    help="Run output directory (will be created).")
     p.add_argument("--primer-file", type=Path, required=True,
-                   help="Primer setup file produced by generate_primer_setup.py.")
+                   help="Primer setup file produced by generate_primer_setup.py. "
+                        "Used by the cutadapt trim step (and by Minibar unless "
+                        "--minibar-primer-file is given).")
+    p.add_argument("--minibar-primer-file", type=Path, default=None,
+                   help="Minibar-specific primer setup file "
+                        "(ITS_primer_setup_minibar_<date>.txt). Minibar demux uses "
+                        "this; if omitted it falls back to --primer-file.")
     p.add_argument("--samplesheet", type=Path, required=True,
                    help="Sample sheet CSV (Client, Sample_ID, Barcode).")
     p.add_argument("--chopper", type=Path, default=DEFAULT_CHOPPER,
@@ -527,6 +564,16 @@ def parse_args() -> argparse.Namespace:
     # ~0.60-0.70 kb; concatemers/junk above ~1.5 kb).
     p.add_argument("--min-length", type=int, default=400)
     p.add_argument("--max-length", type=int, default=1200)
+    # minibar -e: allowed edit distance for barcode-index matching. Raising it
+    # above 1 can rescue unk reads but also grows Multiple_Matches, since the IDT
+    # ITS FwIndex set has a minimum pairwise Hamming distance of 3.
+    # minibar -E: allowed edit distance for primer matching. The wrapper passes 9,
+    # a holdover from matching the full degenerate construct; with the *_minibar
+    # reference (tail+index only) 5 and 9 test identically. See run_minibar().
+    p.add_argument("--barcode-mismatch", type=int, default=1,
+                   help="minibar -e barcode index edit distance (default: 1).")
+    p.add_argument("--primer-mismatch", type=int, default=5,
+                   help="minibar -E primer edit distance (default: 5; wrapper passes 9).")
     p.add_argument("--cutadapt", type=Path, default=DEFAULT_CUTADAPT,
                    help=f"Path to cutadapt binary (default: {DEFAULT_CUTADAPT}).")
     p.add_argument("--cutadapt-threads", type=int, default=4,
@@ -580,6 +627,11 @@ def main() -> None:
         sys.exit(f"ERROR: raw input dir not found: {args.raw_input_dir}")
     if not args.primer_file.is_file():
         sys.exit(f"ERROR: primer file not found: {args.primer_file}")
+    # Minibar reads a barcode layout of its own; fall back to the shared primer
+    # file when no Minibar-specific one is supplied.
+    minibar_primer_file = args.minibar_primer_file or args.primer_file
+    if not minibar_primer_file.is_file():
+        sys.exit(f"ERROR: minibar primer file not found: {minibar_primer_file}")
     if not args.chopper.is_file():
         sys.exit(f"ERROR: chopper not found: {args.chopper}")
     if not args.minibar.is_file():
@@ -595,7 +647,8 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     integrated_dir.mkdir(parents=True, exist_ok=True)
 
-    log(f" Primer file: {args.primer_file}")
+    log(f" Primer file (cutadapt): {args.primer_file}")
+    log(f" Primer file (minibar):  {minibar_primer_file}")
 
     # ---- Step 1 ----
     filtered = run_chopper(
@@ -605,7 +658,11 @@ def main() -> None:
     total_input = count_filtered_total(filtered)
 
     # ---- Step 2 ----
-    per_file_dirs = run_minibar(filtered, output_dir, args.primer_file, args.minibar)
+    per_file_dirs = run_minibar(
+        filtered, output_dir, minibar_primer_file, args.minibar,
+        barcode_mismatch=args.barcode_mismatch,
+        primer_mismatch=args.primer_mismatch,
+    )
     merge_per_file_outputs(per_file_dirs, integrated_dir)
     cleanup(per_file_dirs, filtered_dir)
 

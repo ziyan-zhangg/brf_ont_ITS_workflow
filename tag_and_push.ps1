@@ -13,7 +13,7 @@ $VER = $NEW_VER
 $DATE = "Date: {0}" -f (Get-Date -Format "yyyy-MM-dd")
 
 $COMMENT = @"
-* New: workflow for ITS amplicon
+* Update: fix reference bug and allow filexibility for external dependencies
 "@
 
 Write-Host "Using version: $VER"

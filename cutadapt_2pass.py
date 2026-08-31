@@ -49,6 +49,7 @@ from pathlib import Path
 
 
 # --- Defaults (Gadi) ---------------------------------------------------------
+# tools still under 16s, no need repulicated
 DEFAULT_CUTADAPT = Path("/g/data/vz35/ONT_16s_workflow/tools/cutadapt-env/bin/cutadapt")
 
 # IUPAC complement table for reverse-complementing primer sequences

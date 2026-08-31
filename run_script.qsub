@@ -13,12 +13,17 @@
 
 #--------README---------------------------------------------------------------
 # Slim wrapper around the Python core pipeline.
-#   Pre-step: generate_primer_setup.py  -> ITS_primer_setup_<date>.txt
+#   Pre-step: generate_primer_setup.py  -> ITS_primer_setup_<date>.txt        (cutadapt)
+#                                          ITS_primer_setup_minibar_<date>.txt (Minibar)
 #   Core:     filter_chopper_demux_minibar.py
 #               Step 1 - Chopper filter (Q + length window set in Variables)
-#               Step 2 - Minibar demultiplex (-l 200 -M 2, set in the Python;
-#                        -M 2 is required by the combinatorial index layout)
+#               Step 2 - Minibar demultiplex (-e/-E from Variables below;
+#                        -l 200 -M 2 -F set in the Python. -M 2 is required by
+#                        the combinatorial index layout)
+#               Step 2.5 - Cutadapt two-pass: orient reads + trim 5'/3'
+#                        constructs (cutadapt_2pass.py)
 #               Step 3 - Organise reads by client + write summaries
+#               Final  - Move logs/summaries into run_log_<date>/
 #-----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -30,14 +35,27 @@ date_stamp=$(date +%Y%m%d)
 
 #--------Variables (edit per run)---------------------------------------------
 # run name under /g/data/vz35/PromethION_data/sequencer_uploads/
-run_name=ONT_ITS_20260422
+run_name=ONT_ITS_20260617
 
 # sample sheet CSV (columns: Client, Sample_ID, Barcode; Barcode = ITS01-ITS96)
-samplesheet=/g/data/vz35/ONT_ITS_workflow/sample_sheet/its_samplesheet.csv
+samplesheet=/g/data/vz35/ONT_ITS_workflow/sample_sheet/ITS_samplesheet_20260721.csv
+
+# Barcode references. The same barcode set is needed in two forms, one per tool:
+#   *_minibar : FwPrimer/RvPrimer stop after the Illumina tail + 10 bp index,
+#               so Minibar matches only the constant barcoded tail.
+#   cutadapt  : full construct, carrying the degenerate ITS gene primer as well,
+#               because cutadapt has to trim the gene primer off too.
+# Both must cover every barcode ID used in the sample sheet's Barcode column.
+# If you swap in a different barcode set, also re-check min_length/max_length
+# and primer_mismatch below — both are tuned for the IDT ITS construct.
+barcode_file_minibar=/g/data/vz35/ONT_ITS_workflow/tools/IDT_ITS_96_barcode_minibar.txt
+barcode_file_cutadapt=/g/data/vz35/ONT_ITS_workflow/tools/IDT_ITS_96_barcode.txt
 
 # run output (will hold integrated_demultiplexing/ + read_counts_summary.txt)
 output_dir=/g/data/vz35/ONT_ITS_workflow/minibar_output/ONT_ITS_TBC_${date_stamp}
 
+
+#--------Variables index, change as needed-------------------------------------
 # Chopper read filtering. The length window must bracket the expected amplicon
 # for the primer pair in use, so re-check it whenever the primers change.
 #   ITS (ITS1F/ITS4): main peak ~0.78-0.80 kb, shoulder ~0.60-0.70 kb,
@@ -47,7 +65,23 @@ min_quality=15
 min_length=400
 max_length=1200
 
+# Minibar primer matching. -E is the allowed edit distance when matching the
+# primer. 9 is a holdover from when Minibar matched the full construct, whose
+# IUPAC-degenerate ITS primer positions counted as mismatches before any real
+# sequencing error. 
+# Test done 20260722, primer_mismatch= 5/9 gave the same result.
+# Re-check whenever the primers or the *_minibar reference change.
+primer_mismatch=9
+
+# Minibar barcode matching. -e is the allowed edit distance when matching the
+# barcode index. Raising it above 1 can rescue some unassigned (unk) reads but
+# also grows Multiple_Matches, because the IDT ITS FwIndex set has a minimum
+# pairwise Hamming distance of only 3. 
+# Test done 20260722, keep barcode_mismatch=1.
+barcode_mismatch=1
+
 #--------DONT-CHANGE----------------------------------------------------------
+# only one run folder per directory allowed
 _root=/g/data/vz35/PromethION_data/sequencer_uploads
 mapfile -t _fq_dirs < <(find "${_root}/${run_name}" -type d -name "fastq_pass")
 if [[ ${#_fq_dirs[@]} -eq 0 ]]; then
@@ -65,7 +99,9 @@ generate_primer_script=${tools_dir}/generate_primer_setup.py # attention to loca
 core_script=${tools_dir}/filter_chopper_demux_minibar.py # attention to location
 
 primer_output_dir=/g/data/vz35/ONT_ITS_workflow/sample_sheet
-primer_file="${primer_output_dir}/ITS_primer_setup_${date_stamp}.txt"
+# Generated primer setup files (derived from primer_output_dir + date_stamp).
+primer_file="${primer_output_dir}/ITS_primer_setup_${date_stamp}.txt"                 # cutadapt
+primer_file_minibar="${primer_output_dir}/ITS_primer_setup_minibar_${date_stamp}.txt" # Minibar
 
 mkdir -p "$output_dir"
 
@@ -77,12 +113,25 @@ echo " PRE-STEP: Generating primer setup: $(date)"
 echo "========================================"
 echo " Samplesheet: $samplesheet"
 
+# The generator always writes ITS_primer_setup_<date>.txt, so build the Minibar
+# file first (from the *_minibar barcode reference) and rename it out of the
+# way, then build the cutadapt file, which keeps the default name. Same
+# generator, invoked twice against different -b inputs.
 python3 "$generate_primer_script" \
     "$samplesheet" \
+    -b "$barcode_file_minibar" \
+    -o "$primer_output_dir" \
+    --date "$date_stamp"
+mv "$primer_file" "$primer_file_minibar"
+
+python3 "$generate_primer_script" \
+    "$samplesheet" \
+    -b "$barcode_file_cutadapt" \
     -o "$primer_output_dir" \
     --date "$date_stamp"
 
-echo " Primer file: $primer_file"
+echo " Primer file (cutadapt): $primer_file"
+echo " Primer file (Minibar):  $primer_file_minibar"
 echo "========================================"
 
 #=============================================================================
@@ -91,8 +140,11 @@ echo "========================================"
 python3 "$core_script" \
     --raw-input-dir "$raw_input_dir" \
     --output-dir    "$output_dir" \
-    --primer-file   "$primer_file" \
+    --primer-file          "$primer_file" \
+    --minibar-primer-file  "$primer_file_minibar" \
     --samplesheet   "$samplesheet" \
-    --min-quality   "$min_quality" \
-    --min-length    "$min_length" \
-    --max-length    "$max_length"
+    --min-quality     "$min_quality" \
+    --min-length      "$min_length" \
+    --max-length      "$max_length" \
+    --primer-mismatch  "$primer_mismatch" \
+    --barcode-mismatch "$barcode_mismatch"

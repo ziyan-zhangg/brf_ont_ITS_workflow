@@ -4,3 +4,6 @@ utils/__pycache__
 Filter_Chopper_Demux_Minibar.qsub/
 .vscode/
 Primer/
+emu/
+make_minibar_reference.py/
+__pycache__/
