@@ -39,7 +39,7 @@
 #
 # For a first look at an unfamiliar run, add --diagnostic to the core call:
 # it forces post mode with a 100-5000 bp window so the demux QC observes the
-# real length distribution instead of assuming 400-1200.
+# real length distribution instead of assuming 400-2000.
 #
 #--------Resource notes-------------------------------------------------------
 # Taken from the 16S workflow (v6.00), which uses the same parallel Minibar
@@ -61,7 +61,7 @@
 #
 # walltime=8h  Was 20h for the old serial loop. Step 2 is the dominant cost
 #              and is now parallel. Post mode feeds Minibar every read in
-#              fastq_pass, not only the 400-1200 bp ones, so confirm the
+#              fastq_pass, not only the 400-2000 bp ones, so confirm the
 #              margin against the Step 2 timestamps of the first post run.
 #
 # jobfs=200GB  Was 10GB. Minibar's per-chunk working directories go to
@@ -123,14 +123,16 @@ run_qc_report=1
 # Chopper read filtering. The length window must bracket the expected amplicon
 # for the primer pair in use, so re-check it whenever the primers change.
 #   ITS (ITS1F/ITS4): main peak ~0.78-0.80 kb, shoulder ~0.60-0.70 kb,
-#                     concatemers/junk above ~1.5 kb  -> 400-1200
+#                     concatemers/junk above ~1.5 kb  -> 400-2000
+#                     (max 2000 confirmed on ONT_ITS_20260821: identical
+#                     per-sample delivered reads in pre vs post mode)
 #   full-length 16S:  ~1.5 kb                         -> 1000-2000
 # qc_config.yaml mirrors these (filter.minknow_min_len / chopper_max_len); if
 # you change them here, change them there too, or the QC report warns that
 # the windows differ.
 min_quality=15
 min_length=400
-max_length=1200
+max_length=2000
 
 # Minibar primer matching. -E is the allowed edit distance when matching the
 # primer. 9 is a holdover from when Minibar matched the full construct, whose

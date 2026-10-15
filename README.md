@@ -44,9 +44,9 @@ STEP 6: Organising reads by client    STEP 6: Organising reads by client
 STEP 7: Collecting logs               STEP 7: Collecting logs
 ```
 
-**Why `post` is the default.** Filtering before demultiplexing throws reads away before anyone can see what they looked like, so a low per-sample yield is ambiguous: too few reads, or the right reads outside the assumed 400–1,200 bp window? Running Minibar first makes the demux loss and the filter loss separately visible (steps 3 and 4).
+**Why `post` is the default.** Filtering before demultiplexing throws reads away before anyone can see what they looked like, so a low per-sample yield is ambiguous: too few reads, or the right reads outside the assumed 400–2,000 bp window? Running Minibar first makes the demux loss and the filter loss separately visible (steps 3 and 4).
 
-On ITS runs MinKNOW applies a **400 bp** minimum read length and pass Q15, the same floor as Chopper (`-q 15 --minlength 400 --maxlength 1200`), so in practice Chopper only removes reads > 1,200 bp. Post mode therefore adds only those > 1.2 kb reads to Minibar's load, and in exchange the QC report can measure them per sample (`long_frac`). `-M 2` still applies to them, so they are only assigned on a both-ends barcode match.
+On ITS runs MinKNOW applies a **400 bp** minimum read length and pass Q15, the same floor as Chopper (`-q 15 --minlength 400 --maxlength 2000`), so in practice Chopper only removes reads > 2,000 bp. Post mode therefore adds only those > 2 kb reads to Minibar's load, and in exchange the QC report can measure them per sample (`long_frac`). `-M 2` still applies to them, so they are only assigned on a both-ends barcode match.
 
 Both `run_script.qsub` and the core script default to `post`.
 
@@ -169,7 +169,7 @@ run_qc_report=1                    # 1 = write qc_report/ at the end of the job
 # --- Variables index, change as needed ---
 min_quality=15                     # Chopper -q
 min_length=400                     # Chopper --minlength (ITS default)
-max_length=1200                    # Chopper --maxlength (ITS default)
+max_length=2000                    # Chopper --maxlength (ITS default)
 
 primer_mismatch=9                  # Minibar -E
 barcode_mismatch=1                 # Minibar -e
@@ -211,7 +211,7 @@ These are the 16S workflow's v6.00 values, which uses the same parallel Minibar 
 
 - **ncpus=16 / mem=64GB.** Step 2 runs Minibar on several `fastq_pass` chunks at once (one subprocess per worker, `$PBS_NCPUS` workers). The speed-up is bounded by the number of large chunks and then by the single largest one. Check the PBS resource footer for peak memory on the first run and trim if it is far below 64 GB.
 - **jobfs is 200 GB** (was 10 GB). In `post` mode Minibar's per-file working directories hold unfiltered, uncompressed reads and are much larger than in `pre` mode. On queues that ration jobfs per core, 200 GB may need more than a few CPUs to be schedulable — raise `ncpus` before lowering `jobfs`.
-- **Walltime is 8 h** (was 20 h for the serial loop). `post` mode feeds Minibar every read in `fastq_pass`, including the > 1.2 kb ones, and Minibar is the dominant cost, so check the step 2 timestamps in the job log on the first `post` run before trusting 8 h.
+- **Walltime is 8 h** (was 20 h for the serial loop). `post` mode feeds Minibar every read in `fastq_pass`, including the > 2 kb ones, and Minibar is the dominant cost, so check the step 2 timestamps in the job log on the first `post` run before trusting 8 h.
 
 ### 4. Validate with the control run
 
@@ -270,16 +270,18 @@ Each `*.fastq.gz` file in `fastq_pass/` is piped through Chopper, and reads that
 |--------|-----------|-------|
 | Quality score | `-q` | >= 15 |
 | Minimum length | `--minlength` | 400 bp |
-| Maximum length | `--maxlength` | 1,200 bp |
+| Maximum length | `--maxlength` | 2,000 bp |
 
 All three are set in the **Variables** section of `run_script.qsub` (`min_quality`, `min_length`, `max_length`) and passed through to the core script; the same values are used at step 4 in `post` mode.
 
-The length window must bracket the expected amplicon for the primer pair in use, so re-check it whenever the primers change. The 400-1,200 bp default is sized for ITS: the main peak sits at ~0.78-0.80 kb with a shoulder at ~0.60-0.70 kb, and concatemers/junk appear above ~1.5 kb.
+The length window must bracket the expected amplicon for the primer pair in use, so re-check it whenever the primers change. The 400-2,000 bp default is sized for ITS: the main peak sits at ~0.78-0.80 kb with a shoulder at ~0.60-0.70 kb, and concatemers/junk appear above ~1.5 kb.
+
+**The 2,000 bp maximum was confirmed on `ONT_ITS_20260821`**: pre and post mode gave identical per-sample delivered reads. (It was 1,200 bp before v1.02.) With a 2,000 bp ceiling the ~1.5 kb concatemers are delivered rather than filtered; the QC report counts them against `core_frac` (they sit above the 450–1,000 bp core window), while `long_frac` only sees reads > 2 kb.
 
 The equivalent command run per file:
 
 ```
-zcat <file>.fastq.gz | chopper -q 15 --minlength 400 --maxlength 1200 > <file>_filtered.fastq
+zcat <file>.fastq.gz | chopper -q 15 --minlength 400 --maxlength 2000 > <file>_filtered.fastq
 ```
 
 Filtered files are written **uncompressed** to `$PBS_JOBFS/chopper_filtered/` (falling back to `output_dir/chopper_filtered/` when `PBS_JOBFS` is unset) and deleted automatically after demultiplexing. They are intermediate — Minibar reads them once — and gzipping them at Python's default level 9 cost more than the rest of the step.
@@ -462,11 +464,11 @@ minibar_output/ONT_ITS_TBC_<date>/
 
 `qc_report.py` produces one table per run with one row per sample, a PASS / CHECK / FAIL flag and reason codes, plus run-level verdicts and length/Q heatmaps. It judges only what the facility is responsible for -- did the sample amplify and sequence into usable reads. Chimera %, classified / unclassified reads and NTC read ratios are the client's responsibility and are not reported.
 
-**Thresholds are provisional.** `qc_config.yaml` (`config_version: 1.0-its`) starts from the 16S values and the expected ITS length profile; none has been calibrated on ITS data yet. Calibrate on past ITS runs including **fungal mock / positive controls** — not ZymoBIOMICS D6305, which is a bacterial 16S standard. Until then treat every flag as a prompt to look, not a verdict.
+**Thresholds are provisional.** `qc_config.yaml` (`config_version: 1.1-its`) starts from the 16S values and the expected ITS length profile; none has been calibrated on ITS data yet. Calibrate on past ITS runs including **fungal mock / positive controls** — not ZymoBIOMICS D6305, which is a bacterial 16S standard. Until then treat every flag as a prompt to look, not a verdict.
 
 **Read quality is not flagged.** Every delivered read already passed MinKNOW Q15. The Q distribution is still shown (heatmap and drill-down), and `median_q` is reported, for information only.
 
-The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table. `integrated_demultiplexing/<Client>/<Client>_qc_report.html` is the same page cut to one client; it sits in the client's delivery folder so it ships with the reads.
+The main output is **`qc_report/qc_report.html`**: a single self-contained page (no network access needed -- open it from Gadi, a shared drive or an email attachment) with the run summary, interactive length and Q heatmaps, a click-to-drill-down view per sample and a sortable table (reason codes are shown in the heatmap tooltip and the drill-down, not as a table column). `integrated_demultiplexing/<Client>/<Client>_qc_report.html` is the same page cut to one client; it sits in the client's delivery folder so it ships with the reads.
 
 **Client-safe HTML.** No HTML report contains internal paths or identifiers (no `/g/data`, `/scratch`, `/home`, `vz35`, usernames, sample-sheet or config paths); the config is identified by version and short hash, and paths in warnings are cut to file names. A per-client report contains nothing about other clients -- no sample IDs, barcodes, comments or client names, not even in the embedded data. Its header counts are recomputed for that client; run-level flags appear only as anonymous text (e.g. `RUN: LONG (median 18%, FAIL)`), the drill-down's run-median line is an anonymous aggregate, and warnings and catch-all bin counts are left out.
 
@@ -486,23 +488,23 @@ Pass `output_dir` explicitly: `run_script.qsub` stamps it with the date its job 
 |---|---|---|---|---|
 | `delivered_reads` | `Reads` in `read_counts_summary.txt` | higher | Depth vs the 15,000 floor | flagged |
 | `primer_found` | `pct_pass1_kept` | higher | Correct barcode, wrong amplicon | flagged |
-| `long_frac` | 1 − `pct_retained` (post mode only) | lower | Chimeras, concatemers, ligation artefacts (> 1.2 kb) | flagged |
-| `core_frac` | `demux_qc` length histogram: reads in `core_window` (450–1,000 bp) / reads in 400–1,200 bp | higher | Partial / off-target products outside the expected ITS range | flagged |
+| `long_frac` | 1 − `pct_retained` (post mode only) | lower | Chimeras, concatemers, ligation artefacts (> 2 kb) | flagged |
+| `core_frac` | `demux_qc` length histogram: reads in `core_window` (450–1,000 bp) / reads in 400–2,000 bp | higher | Partial / off-target products and ~1.5 kb concatemers outside the expected ITS range | flagged |
 | `modal_dev_bp` | \|modal length − run median modal length\| | lower | Wrong product / assay mix-up | **info only** |
 
 Informational, never flagged: `median_q`, the median mean-read-Q bin from the `demux_qc` Q histogram, and — for ITS — `modal_dev_bp`.
 
 **Modal length is informational for ITS.** ITS length legitimately varies with community composition (ITS1/ITS2 length differs between fungal taxa), so a sample dominated by short- or long-ITS taxa sits far from the run's median modal length without anything being wrong. The ~650 bp shoulder can even overtake the ~790 bp peak and make the modal length jump by ~140 bp between otherwise similar samples. `modal_dev_bp` and `modal_length` are therefore reported (table, drill-down, `run_qc.txt`) but carry `info_only: true` in `qc_config.yaml` and never set a flag, a reason code or a run flag.
 
-`long_frac = 1 − pct_retained` measures the > 1.2 kb fraction only because MinKNOW's 400 bp floor on ITS runs equals Chopper's `--minlength`, so Chopper removes nothing at the short end. If either changes, `long_frac` would also count short-read loss.
+`long_frac = 1 − pct_retained` measures the > 2 kb fraction only because MinKNOW's 400 bp floor on ITS runs equals Chopper's `--minlength`, so Chopper removes nothing at the short end. If either changes, `long_frac` would also count short-read loss.
 
-`core_frac` and `median_q` are computed on reads within 400–1,200 bp, so they describe the delivered population. `raw_demuxed` in the table is Minibar's count before Chopper.
+`core_frac` and `median_q` are computed on reads within 400–2,000 bp, so they describe the delivered population. `raw_demuxed` in the table is Minibar's count before Chopper.
 
 **Known limit (ITS blind spot).** Anything shorter than `minknow_min_len` (400 bp) is discarded by MinKNOW and never reaches the pipeline. Primer dimers and short non-specific products therefore cannot be measured per sample; a short-product failure can only show up as low `delivered_reads` or a low `core_frac`. Short and low-Q fractions are not reported.
 
 **`core_window` is provisional.** 450–1,000 bp is wide enough to keep both the ~790 bp peak and the ~650 bp shoulder. Confirm it against the `demux_qc/<SampleID>.tsv` length histograms (or the length heatmap) of a real ITS run before relying on `core_frac`.
 
-**Pre-mode runs.** Chopper ran before Minibar, so no > 1.2 kb reads were demultiplexed: `long_frac` is `NA (pre mode)` for every sample and `run_qc.txt` says so at the top. The other metrics still work. Runs whose `demux_qc/` predates the Q histogram get `median_q = NA`, with a warning.
+**Pre-mode runs.** Chopper ran before Minibar, so no > 2 kb reads were demultiplexed: `long_frac` is `NA (pre mode)` for every sample and `run_qc.txt` says so at the top. The other metrics still work. Runs whose `demux_qc/` predates the Q histogram get `median_q = NA`, with a warning.
 
 ### Flagging
 
@@ -529,22 +531,22 @@ Everything assay-specific lives here, so the same `qc_report.py` serves 16S and 
 | `assay` / `title` | `ITS` / `ITS QC report` | Report title and headers (default `16S` / `16S QC report` when absent) |
 | `filter.minknow_min_len` | 400 | MinKNOW minimum read length on ITS runs; lower edge of the delivered window |
 | `filter.minknow_min_q` | 15 | MinKNOW pass Q |
-| `filter.chopper_max_len` | 1200 | Chopper `--maxlength`; upper edge of the delivered window, and what "long" means (`> 1.2 kb` in every label) |
+| `filter.chopper_max_len` | 2000 | Chopper `--maxlength`; upper edge of the delivered window, and what "long" means (`> 2 kb` in every label). Confirmed on `ONT_ITS_20260821` |
 | `core_window` | 450–1,000 | `core_frac` numerator; multiples of 50, inside the delivered window |
-| `plot.len_min` / `plot.len_max` | 400 / 2,000 | Length axis of the heatmaps and drill-down; must start at or below `minknow_min_len` and end above `chopper_max_len` (default `minknow_min_len` .. 2 × `chopper_max_len`) |
+| `plot.len_min` / `plot.len_max` | 400 / 3,000 | Length axis of the heatmaps and drill-down; must start at or below `minknow_min_len` and end above `chopper_max_len` (default `minknow_min_len` .. 2 × `chopper_max_len`) |
 | `metrics.<m>.info_only` | `true` for `modal_dev_bp` | Report but never flag; `check` / `fail` not needed |
 
 ### Outputs -- `<output_dir>/qc_report/`
 
 | File | Contents |
 |---|---|
-| `qc_report.html` | **Main review view** (internal, all samples). One self-contained file (data embedded as JSON, inline JS/CSS, no external libraries or network). Header with filter stage, config version, flag counts and run-level flags; filter by client / flag / sample name and sort by any column; length and Q heatmaps side by side (hover for details); click a row for that sample's length and Q histograms against the run median, each metric's PASS / CHECK / FAIL (or *info*) badge and threshold, reasons and Comment; sortable table of all samples. Written with the standard library only, so it is produced even without matplotlib |
+| `qc_report.html` | **Main review view** (internal, all samples). One self-contained file (data embedded as JSON, inline JS/CSS, no external libraries or network). Header with filter stage, config version, flag counts and run-level flags; filter by client / flag / sample name and sort by any column; length and Q heatmaps side by side (hover for details); click a row for that sample's length and Q histograms against the run median, each metric's PASS / CHECK / FAIL (or *info*) badge and threshold, reasons and Comment; sortable table of all samples (flag, client, sample, barcode, location, Comment, counts and metrics -- no Reasons column; reason codes are in the heatmap tooltip, the drill-down and the TSVs). Written with the standard library only, so it is produced even without matplotlib |
 | `per_sample_qc.tsv` | One row per sample: client, sample, barcode, type, `raw_demuxed`, every metric, `modal_length`, `median_q` (info), flag, reasons, Comment. `#` header records assay, config version, filter stage, windows and which metrics are info-only |
 | `per_client/<Client>_qc.tsv` | Per-client cut of the same table, plus shared controls |
 | `../integrated_demultiplexing/<Client>/<Client>_qc_report.html` | Per-client cut of `qc_report.html` (same layout and interactivity), written into the client's delivery folder next to its reads and `summary.txt`; see "Client-safe HTML" above. If the run dir has no `integrated_demultiplexing/`, it goes to `qc_report/per_client/` with a warning |
 | `run_qc.txt` | Assay, config version, filter stage, windows, run-level flags and medians, flag counts, `unk` / `Multiple_Matches` share, warnings |
 | `qc_bins.tsv.gz` | Long format (sample, kind, bin, count); kind `len` (50 bp, all reads), `q` (in-window reads), `q_all` -- for re-plotting / re-thresholding |
-| `length_heatmap.png`, `q_heatmap.png` | Static copies for email / records. Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 400–2,000 bp shows the > 1.2 kb tail, core window shaded, dashed lines at 400 and 1,200 bp; the Q heatmap is informational and has no threshold line. Flag strip on the left, flagged rows labelled |
+| `length_heatmap.png`, `q_heatmap.png` | Static copies for email / records. Rows = samples (FAIL, CHECK, PASS, CTRL, then sheet order), row-normalised. Length axis 400–3,000 bp shows the > 2 kb tail, core window shaded, dashed lines at 400 and 2,000 bp; the Q heatmap is informational and has no threshold line. Flag strip on the left, flagged rows labelled |
 | `flagged/<Sample>.png` | Only with `--png-drilldown`: length and Q histograms for CHECK / FAIL samples (the HTML report has the same drill-down) |
 
 ### Requirements and tests
@@ -559,7 +561,7 @@ python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
 
 `tools_dir` (and `qc_python`, `qc_config`, `samplesheet`) can be overridden with `qsub -v`, so a dev copy can be tested without editing the scripts: `qsub -v output_dir=<run>,samplesheet=<sheet.csv>,tools_dir=<dev checkout> run_qc_report.qsub`.
 
-`python tests/test_qc_report.py` builds fake ITS runs in post and pre mode (real `demux_qc` + production `read_counts_summary.txt` writer) and checks: the ITS config loads; a core window below 1 kb is accepted and windows outside the delivered range are rejected; a legacy 16S config still loads with 16S defaults; the Q bins and `median_q` against a direct calculation; every metric and flag (Q and `modal_dev_bp` never flagged, even with a wildly spread modal length); the counts parser incl. pre-mode NA handling; relative mode; controls; old-config warnings; that the HTML title, long-read label and length axis come from the config (no `16S` / `2 kb` left); that `qc_report.html` parses, contains every sample, has no `http://` / `https://` references and is still written without matplotlib; and that no HTML report — internal or per-client — contains `/g/data`, `/scratch`, `/home` or `vz35`.
+`python tests/test_qc_report.py` builds fake ITS runs in post and pre mode (real `demux_qc` + production `read_counts_summary.txt` writer) and checks: the ITS config loads; a core window below 1 kb is accepted and windows outside the delivered range are rejected; a legacy 16S config still loads with 16S defaults; the Q bins and `median_q` against a direct calculation; every metric and flag (Q and `modal_dev_bp` never flagged, even with a wildly spread modal length); the counts parser incl. pre-mode NA handling; relative mode; controls; old-config warnings; that the HTML title, long-read label and length axis come from the config (no `16S` left, and a config with a different `chopper_max_len` leaves no `2 kb` behind); that the HTML table has no Reasons column while reasons stay in the drill-down data and the TSV; that `qc_report.html` parses, contains every sample, has no `http://` / `https://` references and is still written without matplotlib; and that no HTML report — internal or per-client — contains `/g/data`, `/scratch`, `/home` or `vz35`.
 
 ---
 
@@ -571,7 +573,7 @@ python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
 |-----------|-------|--------|
 | `-q 15` | 15 | Minimum mean quality score |
 | `--minlength 400` | 400 bp | Discard reads shorter than this |
-| `--maxlength 1200` | 1,200 bp | Discard reads longer than this |
+| `--maxlength 2000` | 2,000 bp | Discard reads longer than this |
 
 ### Minibar
 
@@ -617,7 +619,7 @@ python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
 | `--cutadapt` | Gadi 16S tools path | Cutadapt binary |
 | `--min-quality` | 15 | Chopper `-q` |
 | `--min-length` (`--minlength`) | 400 | Chopper `--minlength` |
-| `--max-length` (`--maxlength`) | 1200 | Chopper `--maxlength` |
+| `--max-length` (`--maxlength`) | 2000 | Chopper `--maxlength` |
 | `--barcode-mismatch` | 1 | Minibar `-e` |
 | `--primer-mismatch` | 5 | Minibar `-E` (wrapper passes 9) |
 | `--cutadapt-threads` | 4 | Cutadapt `-j` |
@@ -625,7 +627,7 @@ python3 -m venv /g/data/vz35/ONT_16s_workflow/tools/qc_env
 
 ### Diagnostic mode
 
-For a first look at an unfamiliar run, `--diagnostic` forces `post` mode with a 100–5,000 bp window so step 3 observes the **real** length distribution instead of only what survives an assumed 400–1,200 bp window. Read `demux_qc/demux_qc_summary.tsv`, pick a window that matches the observed modal length and N50, then do the production run with those values. (MinKNOW's 400 bp floor still applies, so nothing below 400 bp is visible even here.)
+For a first look at an unfamiliar run, `--diagnostic` forces `post` mode with a 100–5,000 bp window so step 3 observes the **real** length distribution instead of only what survives an assumed 400–2,000 bp window. Read `demux_qc/demux_qc_summary.tsv`, pick a window that matches the observed modal length and N50, then do the production run with those values. (MinKNOW's 400 bp floor still applies, so nothing below 400 bp is visible even here.)
 
 ### Running demux QC standalone
 
@@ -635,7 +637,7 @@ For a first look at an unfamiliar run, `--diagnostic` forces `post` mode with a 
 python3 demux_qc.py \
     --integrated-dir /path/to/run_output/integrated_demultiplexing \
     [--qc-dir /path/to/demux_qc] \
-    [--minlength 400] [--maxlength 1200] [--filter-stage pre|post]
+    [--minlength 400] [--maxlength 2000] [--filter-stage pre|post]
 ```
 
 It only reads the FASTQs — it never rewrites reads — so it is safe to run against a completed run. Note that after step 6 the per-sample files have been renamed to `<SampleID>.fastq.gz` and moved into client subdirectories, so a standalone run against the top level will only find the `sample_unk` / `sample_Multiple_Matches` bins.

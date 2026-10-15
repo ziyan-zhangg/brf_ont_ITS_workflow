@@ -425,8 +425,8 @@ def parse_args() -> argparse.Namespace:
     # Defaults match the ITS Chopper window in run_script.qsub.
     p.add_argument("--minlength", type=int, default=400,
                    help="Lower bound of the reported length window (default: 400).")
-    p.add_argument("--maxlength", type=int, default=1200,
-                   help="Upper bound of the reported length window (default: 1200).")
+    p.add_argument("--maxlength", type=int, default=2000,
+                   help="Upper bound of the reported length window (default: 2000).")
     p.add_argument("--filter-stage", choices=("pre", "post"), default="post",
                    help="Recorded in the output so stages stay comparable.")
     return p.parse_args()

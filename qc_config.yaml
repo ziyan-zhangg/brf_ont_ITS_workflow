@@ -21,7 +21,7 @@
 #     modal length is far from the run median is not by itself a failure.
 #   * core_window is wide and below 1 kb; see the note at core_window.
 
-config_version: 1.0-its
+config_version: 1.1-its       # 1.1: chopper_max_len 1200 -> 2000, plot to 3000
 
 assay: ITS                    # used in the report title / headers
 title: ITS QC report
@@ -31,8 +31,10 @@ filter:                       # informational; must mirror production
                               # ITS runs; same as Chopper min_length, so in
                               # post mode Chopper only removes long reads
   minknow_min_q: 15           # MinKNOW pass Q
-  chopper_max_len: 1200       # Chopper --maxlength (run_script.qsub
-                              # max_length); longer reads are dropped
+  chopper_max_len: 2000       # Chopper --maxlength (run_script.qsub
+                              # max_length); longer reads are dropped.
+                              # 2000 confirmed on ONT_ITS_20260821: identical
+                              # per-sample delivered reads, pre vs post mode
 
 # Core amplicon window for core_frac, in bp, half-open [min, max). Both ends
 # must be multiples of the 50 bp demux_qc bin width and lie inside
@@ -42,12 +44,16 @@ filter:                       # informational; must mirror production
 # ~0.78-0.80 kb, shoulder ~0.60-0.70 kb), wide enough to keep both. Confirm
 # against the demux_qc/<SampleID>.tsv length histograms of a real ITS run
 # before relying on core_frac, and narrow it if the observed profile allows.
+#
+# With chopper_max_len 2000 the core_frac denominator is 400-2000 bp, so
+# ~1.5 kb concatemers are delivered and counted against core_frac (they sit
+# above the core window), while long_frac only sees reads > 2 kb.
 core_window: {min: 450, max: 1000}
 
 # Length axis of the heatmaps and drill-down, in bp (multiples of 50). Must
 # start at or below minknow_min_len and end above chopper_max_len so the
 # long_frac tail is visible. Reads outside are clamped into the end bins.
-plot: {len_min: 400, len_max: 2000}
+plot: {len_min: 400, len_max: 3000}
 
 # Below this many raw demultiplexed reads, every metric except
 # delivered_reads is NA (n<N).
@@ -66,8 +72,8 @@ min_reads_for_stats: 200
 metrics:
   delivered_reads: {direction: higher_better, check: 15000, fail: 5000, absolute_only: true}
   primer_found:    {direction: higher_better, check: 0.90, fail: 0.75}
-  long_frac:       {direction: lower_better,  check: 0.05, fail: 0.15}
-  core_frac:       {direction: higher_better, check: 0.75, fail: 0.50}
+  long_frac:       {direction: lower_better,  check: 0.10, fail: 0.20}
+  core_frac:       {direction: higher_better, check: 0.50, fail: 0.30}
   modal_dev_bp:    {direction: lower_better,  info_only: true}
 
 run_level:

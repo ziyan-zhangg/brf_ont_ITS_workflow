@@ -278,7 +278,6 @@ const COLS = [
   { key: "modal_length", label: "Modal length", type: "num" },
   { key: "modal_dev_bp", label: MBY.modal_dev_bp.info_only ? "Modal dev (info)" : "Modal dev", type: "metric" },
   { key: "median_q", label: "Median Q (info)", type: "info" },
-  { key: "reasons", label: "Reasons", type: "str" },
 ];
 const COL = Object.fromEntries(COLS.map(c => [c.key, c]));
 
@@ -667,7 +666,7 @@ function cell(s, c) {
   }
   if (c.type === "num") return `<td class="num">${v == null ? "" : int(v)}</td>`;
   if (c.key === "client" && s.shared) return `<td>${esc(s.client || "shared")} <span class="info">(shared control)</span></td>`;
-  const wrap = c.key === "reasons" || c.key === "comment" ? ' class="wrap"' : "";
+  const wrap = c.key === "comment" ? ' class="wrap"' : "";
   return `<td${wrap}>${esc(v)}</td>`;
 }
 function renderTable(rows) {

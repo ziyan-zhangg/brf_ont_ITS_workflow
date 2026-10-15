@@ -47,9 +47,9 @@ from demux_qc import run_demux_qc  # noqa: E402
 
 Q40, Q20, Q17, Q10 = "I", "5", "2", "+"
 
-# Production ITS windows: Chopper 400-1200 bp (run_script.qsub), which the
+# Production ITS windows: Chopper 400-2000 bp (run_script.qsub), which the
 # config mirrors as minknow_min_len / chopper_max_len.
-MIN_LEN, MAX_LEN = 400, 1200
+MIN_LEN, MAX_LEN = 400, 2000
 PEAK, SHOULDER = 790, 650          # ITS1F/ITS4 main peak and shoulder
 
 
@@ -65,7 +65,7 @@ DESIGN = {
     "S10": [(300, PEAK, Q20)],                          # exactly Q20: counts
     "Mixed": [(200, PEAK, Q40), (100, SHOULDER, Q40)],  # peak + shoulder: PASS
     "BP_core": [(140, PEAK, Q40), *outside_core(160)],  # core 47%
-    "BP_long": [(270, PEAK, Q40), (30, 1600, Q40)],     # 10% > 1.2 kb
+    "BP_long": [(270, PEAK, Q40), (30, 2600, Q40)],     # 10% > 2 kb
     "BP_q": [(150, PEAK, Q40), (150, PEAK, Q17)],       # median Q17: not flagged
     "ModalOff": [(300, 550, Q40)],                      # modal 240 bp off: info only
     "BP_primer": [(300, PEAK, Q40)],                    # 70% primer found
@@ -111,7 +111,7 @@ def write_demux_fastqs(d: Path) -> None:
 
 
 def chopper_counts(sid):
-    """(raw, kept) as production Chopper (-q 15, 400-1200 bp) would."""
+    """(raw, kept) as production Chopper (-q 15, 400-2000 bp) would."""
     raw = kept = 0
     for length, q in reads_of(sid):
         raw += 1
@@ -192,7 +192,9 @@ def html_blob(path: Path) -> dict:
 
 
 def says_2kb(text: str) -> bool:
-    """True if the text carries the 16S '2 kb' label ('1.2 kb' does not count)."""
+    """True if the text says '2 kb' ('1.2 kb' does not count). Used on a page
+    built from a config whose chopper_max_len is not 2000, so any '2 kb' left
+    would be a hard-coded label."""
     return re.search(r"(?<![\d.])2 kb", text) is not None
 
 
@@ -222,18 +224,18 @@ def main() -> int:
 
     # ---- 0. ITS config -----------------------------------------------------
     cfg = qc.load_config(ROOT / "qc_config.yaml")
-    check(cfg["config_version"] == "1.0-its" and cfg["assay"] == "ITS"
+    check(cfg["config_version"] == "1.1-its" and cfg["assay"] == "ITS"
           and cfg["title"] == "ITS QC report"
           and cfg["filter"] == {"minknow_min_len": MIN_LEN, "minknow_min_q": 15,
                                 "chopper_max_len": MAX_LEN}
           and cfg["core_window"] == {"min": 450, "max": 1000}
-          and cfg["plot"] == {"len_min": 400, "len_max": 2000}
+          and cfg["plot"] == {"len_min": 400, "len_max": 3000}
           and cfg["metrics"]["modal_dev_bp"]["info_only"]
           and qc.flagged_metrics(cfg) == ["delivered_reads", "primer_found",
                                           "long_frac", "core_frac"]
           and not cfg["_warnings"],
-          "ITS config loads: 1.0-its, 400-1200 bp, core 450-1000, plot "
-          "400-2000, modal_dev_bp info_only, no warnings",
+          "ITS config loads: 1.1-its, 400-2000 bp, core 450-1000, plot "
+          "400-3000, modal_dev_bp info_only, no warnings",
           f"ITS config: {cfg}")
 
     narrow = variant_config(tmp, "narrow.yaml", cw=(
@@ -244,7 +246,7 @@ def main() -> int:
           f"narrow core window: {c2['core_window']}")
     for label, bad_cw, want in (
             ("below the delivered window", "{min: 350, max: 1000}", "must lie inside"),
-            ("above the delivered window", "{min: 450, max: 1250}", "must lie inside"),
+            ("above the delivered window", "{min: 450, max: 2050}", "must lie inside"),
             ("off the 50 bp grid", "{min: 425, max: 1000}", "multiples of the 50")):
         p = variant_config(tmp, "bad_cw.yaml", cw=(
             "core_window: {min: 450, max: 1000}", f"core_window: {bad_cw}"))
@@ -252,11 +254,11 @@ def main() -> int:
         check(want in msg, f"core window {label} rejected",
               f"core window {label}: {msg!r}")
     for label, bad_plot in (("plot ending inside the delivered window",
-                             "{len_min: 400, len_max: 1200}"),
+                             "{len_min: 400, len_max: 2000}"),
                             ("plot starting above minknow_min_len",
-                             "{len_min: 450, len_max: 2000}")):
+                             "{len_min: 450, len_max: 3000}")):
         p = variant_config(tmp, "bad_plot.yaml", plot=(
-            "plot: {len_min: 400, len_max: 2000}", f"plot: {bad_plot}"))
+            "plot: {len_min: 400, len_max: 3000}", f"plot: {bad_plot}"))
         msg = expect_exit(qc.load_config, p)
         check("plot range" in msg, f"{label} rejected", f"{label}: {msg!r}")
 
@@ -303,8 +305,8 @@ def main() -> int:
     summ = table(dq / "demux_qc_summary.tsv", key=0)
     check(summ["S10"]["median_q"] == "20" and summ["BP_q"]["median_q"] == "17"
           and summ["S01"]["window_min"] == "400"
-          and summ["S01"]["window_max"] == "1200",
-          "demux_qc_summary.tsv median_q column and 400-1200 window",
+          and summ["S01"]["window_max"] == "2000",
+          "demux_qc_summary.tsv median_q column and 400-2000 window",
           f"summary: S10={summ['S10']} BP_q={summ['BP_q'].get('median_q')}")
 
     # ---- 2. post-mode end to end -------------------------------------------
@@ -344,7 +346,7 @@ def main() -> int:
           "median_q reported but never flagged; NA below min reads",
           f"median_q: BP_q={t['BP_q']} Tiny={t['Tiny']['median_q']}")
     check(t["BP_long"]["core_frac"] == "1.0000",
-          "core_frac counts only reads inside 400-1200 bp",
+          "core_frac counts only reads inside 400-2000 bp",
           f"BP_long core_frac: {t['BP_long']['core_frac']}")
     check(t["Tiny"]["core_frac"] == "NA (n<200)"
           and t["Tiny"]["primer_found"] == "NA (n<200)",
@@ -360,10 +362,10 @@ def main() -> int:
           f"ModalOff row: {t['ModalOff']}")
 
     head = (qd / "per_sample_qc.tsv").read_text()
-    check("# config_version\t1.0-its" in head and "# filter_stage\tpost" in head
+    check("# config_version\t1.1-its" in head and "# filter_stage\tpost" in head
           and "# assay\tITS" in head
           and "# modal_dev_bp\tinformational, not flagged" in head
-          and "> 1.2 kb reads visible" in head,
+          and "> 2 kb reads visible" in head,
           "TSV header records assay, config version, filter stage, info_only",
           "TSV header lacks assay / config version / filter stage / info_only")
     check((qd / "per_client" / "ClientA_qc.tsv").is_file(),
@@ -413,25 +415,25 @@ def main() -> int:
     a = blob["axes"]["len"]
     check("<title>ITS QC report - run_post</title>" in page
           and blob["run"]["title"] == "ITS QC report"
-          and blob["run"]["long_label"] == "> 1.2 kb"
-          and mby["long_frac"]["label"] == "Long reads (> 1.2 kb)"
-          and "16S" not in page and not says_2kb(page)
-          and (a["min"], a["max"], a["step"]) == (400, 2000, 50),
+          and blob["run"]["long_label"] == "> 2 kb"
+          and mby["long_frac"]["label"] == "Long reads (> 2 kb)"
+          and "16S" not in page and "1.2 kb" not in page
+          and (a["min"], a["max"], a["step"]) == (400, 3000, 50),
           "HTML title, long-read label and length axis from the ITS config; "
-          "no '16S' / '2 kb' anywhere",
+          "no '16S' / old '1.2 kb' anywhere",
           f"title/labels: {blob['run'].get('title')} {blob['run'].get('long_label')} "
-          f"axes {a}; '16S' in page: {'16S' in page}; '2 kb' in page: {says_2kb(page)}")
+          f"axes {a}; '16S' in page: {'16S' in page}; '1.2 kb' in page: {'1.2 kb' in page}")
     custom = variant_config(tmp, "custom.yaml",
                             title=("title: ITS QC report", "title: Fungal ITS2 QC"),
-                            maxlen=("chopper_max_len: 1200", "chopper_max_len: 1500"),
-                            plot=("plot: {len_min: 400, len_max: 2000}",
+                            maxlen=("chopper_max_len: 2000", "chopper_max_len: 1500"),
+                            plot=("plot: {len_min: 400, len_max: 3000}",
                                   "plot: {len_min: 0, len_max: 2500}"))
     run_report(out, sheet, config=custom)
     cpage = (qd / "qc_report.html").read_text(encoding="utf-8")
     cblob = html_blob(qd / "qc_report.html")
     check("<title>Fungal ITS2 QC - run_post</title>" in cpage
           and cblob["run"]["long_label"] == "> 1.5 kb"
-          and "1.2 kb" not in cpage
+          and not says_2kb(cpage)
           and (cblob["axes"]["len"]["min"], cblob["axes"]["len"]["max"]) == (0, 2500),
           "changing title / chopper_max_len / plot in the config changes the page",
           f"custom config page: {cblob['run'].get('title')} "
@@ -516,6 +518,14 @@ def main() -> int:
           and '{ key: "type", label: "Type"' not in lpage,
           "sample table shows Comment instead of Type",
           "sample table columns not as expected")
+    check('key: "reasons"' not in lpage
+          and ls["Tiny"]["reasons"] == "FAIL: READS(100)"
+          and "<b>Reasons:</b>" in lpage and "esc(s.reasons)" in lpage
+          and table(leak / "qc_report" / "per_sample_qc.tsv")["Tiny"]["reasons"]
+          == "FAIL: READS(100)",
+          "no Reasons column in the HTML table; reasons kept in the embedded "
+          "data (tooltip / drill-down) and in per_sample_qc.tsv",
+          "Reasons column still in the HTML table, or reasons missing elsewhere")
 
     leak_pages = sorted((leak / "integrated_demultiplexing").glob("*/*.html"))
     check(len(leak_pages) == 2, "per-client HTML present in the leak run",
@@ -599,15 +609,16 @@ def main() -> int:
     check(rc == 0 and tp["S01"]["long_frac"] == "NA (pre mode)"
           and tp["BP_long"]["long_frac"] == "NA (pre mode)"
           and tp["S01"]["core_frac"] == "1.0000" and "NOTE: pre-mode run" in rq
-          and "reads > 1.2 kb were never demultiplexed" in rq,
+          and "reads > 2 kb were never demultiplexed" in rq,
           "pre mode: long_frac NA (pre mode), noted at top of run_qc.txt "
           "with the ITS long-read label",
           f"pre-mode S01: {tp.get('S01')}\n{rq}")
     ppage = (out_pre / "qc_report" / "qc_report.html").read_text(encoding="utf-8")
-    check(not says_2kb(ppage) and html_blob(
-              out_pre / "qc_report" / "qc_report.html")["run"]["filter_stage"] == "pre",
-          "pre-mode HTML carries no hard-coded '2 kb'",
-          "pre-mode HTML still says '2 kb'")
+    pblob = html_blob(out_pre / "qc_report" / "qc_report.html")
+    check(pblob["run"]["filter_stage"] == "pre"
+          and pblob["run"]["long_label"] == "> 2 kb" and "1.2 kb" not in ppage,
+          "pre-mode HTML takes its long-read label from the config",
+          f"pre-mode HTML label: {pblob['run'].get('long_label')}")
 
     # ---- 4. counts parser --------------------------------------------------
     cp = qc.parse_read_counts(out / "run_log_20261013" / "read_counts_summary.txt")

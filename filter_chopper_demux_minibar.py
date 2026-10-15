@@ -20,7 +20,7 @@ skips exactly one step: pre skips step 4, post skips step 1.
              demultiplexed reads, before any filtering
     Step 4 - Chopper:  filter each merged sample_<SampleID>.fastq for Q and
              a length window set by --min-length/--max-length (defaults
-             400-1200 bp, sized for ITS; set these per primer pair from the
+             400-2000 bp, sized for ITS; set these per primer pair from the
              qsub wrapper)
     Step 5 - Cutadapt: two-pass per-sample orientation + 5'/3' primer trim
              Pass 1: -g FWD --revcomp --rename={header} --discard-untrimmed
@@ -67,7 +67,7 @@ Usage:
         [--chopper /path/to/chopper] \\
         [--minibar  /path/to/minibar.py] \\
         [--cutadapt /path/to/cutadapt] \\
-        [--min-quality 15] [--min-length 400] [--max-length 1200] \\
+        [--min-quality 15] [--min-length 400] [--max-length 2000] \\
         [--barcode-mismatch 1] [--primer-mismatch 9] \\
         [--minibar-work-dir $PBS_JOBFS] \\
         [--diagnostic]
@@ -75,7 +75,7 @@ Usage:
     --diagnostic is shorthand for
         --filter-stage post --min-length 100 --max-length 5000
     so a first pass observes the real length distribution instead of
-    assuming the 400-1200 bp window.
+    assuming the 400-2000 bp window.
 """
 
 from __future__ import annotations
@@ -505,7 +505,7 @@ def run_minibar(
     is used instead — which it is; leaving headroom matters because ONT reads
     often carry a few bases of noise before the adapter starts.
 
-    Post mode feeds Minibar the raw fastq_pass reads, i.e. also the > 1200 bp
+    Post mode feeds Minibar the raw fastq_pass reads, i.e. also the > 2000 bp
     reads that pre mode would have filtered out first. -M 2 means those reads
     are still only assigned on a both-ends barcode match, so this changes how
     many reads Minibar has to scan, not how they are assigned.
@@ -984,7 +984,9 @@ def parse_args() -> argparse.Namespace:
     # accepted as aliases, matching the 16S workflow.
     # Length window depends on the primer pair — override per run from the
     # qsub wrapper. Defaults suit ITS (main peak ~0.78-0.80 kb, shoulder
-    # ~0.60-0.70 kb; concatemers/junk above ~1.5 kb).
+    # ~0.60-0.70 kb; concatemers/junk above ~1.5 kb). The 2000 bp max was
+    # confirmed on ONT_ITS_20260821 (identical per-sample delivered reads in
+    # pre vs post mode).
     p.add_argument("--min-quality", "-q", type=int, default=None,
                    help="Chopper -q minimum mean read quality (default: 15).")
     p.add_argument("--min-length", "--minlength", dest="minlength",
@@ -992,7 +994,7 @@ def parse_args() -> argparse.Namespace:
                    help="Chopper --minlength (default: 400).")
     p.add_argument("--max-length", "--maxlength", dest="maxlength",
                    type=int, default=None,
-                   help="Chopper --maxlength (default: 1200).")
+                   help="Chopper --maxlength (default: 2000).")
 
     p.add_argument("--diagnostic", action="store_true",
                    help="Shorthand for --filter-stage post --min-length 100 "
@@ -1026,7 +1028,7 @@ def parse_args() -> argparse.Namespace:
 
 
 # Standard filter window (ITS), and the wide window --diagnostic swaps in.
-_DEFAULTS = {"min_quality": 15, "minlength": 400, "maxlength": 1200}
+_DEFAULTS = {"min_quality": 15, "minlength": 400, "maxlength": 2000}
 _DIAGNOSTIC = {"filter_stage": "post", "minlength": 100, "maxlength": 5000}
 
 

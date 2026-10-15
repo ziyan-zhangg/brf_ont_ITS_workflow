@@ -6,14 +6,22 @@ Date: 2026-10-15
   flags unchanged (-e 1 -E 9 from run_script.qsub, -l 200 -M 2 -F fixed).
   PBS resources raised to ncpus=16, mem=64GB, jobfs=200GB, walltime=8h (from 16S
   v6.00; confirm on the first ITS post-mode run).
+* Change: default Chopper max length 1200 -> 2000 bp (run_script.qsub max_length,
+  core script and demux_qc.py defaults, qc_config.yaml chopper_max_len). 2000 bp
+  confirmed on ONT_ITS_20260821: identical per-sample delivered reads, pre vs post
+  mode. ~1.5 kb concatemers are now delivered and count against core_frac;
+  long_frac covers reads > 2 kb.
 * Add: per-sample demux QC (demux_qc.py) and extended read_counts_summary.txt
   (raw_demuxed, post_chopper, pct_retained, post_cutadapt_pass1, pct_pass1_kept).
 * Add: per-sample QC report ported from the 16S workflow (qc_report.py,
-  qc_report_template.html, qc_config.yaml 1.0-its, run_qc_report.qsub,
-  tests/test_qc_report.py). Runs at the end of run_script.qsub (run_qc_report=1).
+  qc_report_template.html, qc_config.yaml, run_qc_report.qsub,
+  tests/test_qc_report.py; qc_config.yaml now 1.1-its: chopper_max_len 2000,
+  plot to 3000 bp). Runs at the end of run_script.qsub (run_qc_report=1).
   qc_report.py is assay-neutral: title, plot range and "> N kb" labels come from
   the config; metrics can be info_only. For ITS, modal_dev_bp is info_only.
   Thresholds are provisional until calibrated on fungal mock / positive controls.
+  The HTML sample table has no Reasons column; reason codes are in the heatmap
+  tooltip, the drill-down and the TSVs.
 * Requires: shared venv /g/data/vz35/ONT_16s_workflow/tools/qc_env (PyYAML, matplotlib).
 
 v1.01
