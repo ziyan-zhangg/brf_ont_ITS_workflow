@@ -4,23 +4,54 @@ filter_chopper_demux_minibar.py
 
 Python rewrite of the core function of Filter_Chopper_Demux_Minibar.qsub.
 
-Pipeline:
-    Step 1 - Chopper:    filter each fastq.gz for Q >= 15 and a length window
-             set by --min-length/--max-length (defaults 400-1200 bp, sized
-             for ITS; set these per primer pair from the qsub wrapper)
-    Step 2 - Minibar:    demultiplex each filtered file but keep the primer
-             usage: python3 minibar.py -e E -E P -l 200 -M 2 -F
-             -e/-E come from --barcode-mismatch/--primer-mismatch (set in the
-             qsub wrapper); -l/-M/-F are fixed here. Minibar reads the
-             *_minibar primer setup file (tail+index only), not the cutadapt one.
-    Step 2.5 - Cutadapt: two-pass per-sample orientation + 5'/3' primer trim
+Two filter orderings are supported via --filter-stage; both are runnable on
+the same input so they can be compared directly.
+
+The step numbering below is shared by both modes -- step N always means the
+same thing -- so the job logs of a pre run and a post run line up. Each mode
+skips exactly one step: pre skips step 4, post skips step 1.
+
+--filter-stage post (default):
+    Step 1 - skipped.  Raw fastq_pass/*.fastq.gz go straight to Minibar;
+             fastq_pass is already MinKNOW filtered (>= 400 bp, Q15 on ITS
+             runs), so there is no pre-filter at all.
+    Step 2 - Minibar:  demultiplex the raw files, merge, keep primers
+    Step 3 - Demux QC: per-sample length/quality profile of the raw
+             demultiplexed reads, before any filtering
+    Step 4 - Chopper:  filter each merged sample_<SampleID>.fastq for Q and
+             a length window set by --min-length/--max-length (defaults
+             400-1200 bp, sized for ITS; set these per primer pair from the
+             qsub wrapper)
+    Step 5 - Cutadapt: two-pass per-sample orientation + 5'/3' primer trim
              Pass 1: -g FWD --revcomp --rename={header} --discard-untrimmed
              Pass 2: -a REV_RC  (tolerant; keeps truncated reads)
              Replaces sample_<SampleID>.fastq with <SampleID>.fastq.gz.
-    Step 3 - Organise:   group by client, write summaries
-    Final  - Logs:       move all *.log/*.txt logs to run_log_<date>/
+    Step 6 - Organise: group by client, write summaries
+    Step 7 - Logs:     move all *.log/*.txt logs to run_log_<date>/
 
-This script assumes the primer setup file has already been generated
+--filter-stage pre (legacy ordering):
+    Step 1 - Chopper:  filter each raw fastq.gz for Q/length before demux,
+             writing plain fastq to jobfs (intermediate, deleted at step 2)
+    Step 2 - Minibar:  demultiplex each filtered file, merge, keep primers
+    Step 3 - Demux QC: per-sample stats (see note below)
+    Step 4 - skipped.  Chopper already ran at step 1.
+    Step 5 - Cutadapt: as above
+    Step 6 - Organise: group by client, write summaries
+    Step 7 - Logs:     move all *.log/*.txt logs to run_log_<date>/
+
+Minibar flags are identical in both modes: python3 minibar.py -e E -E P
+-l 200 -M 2 -F. -e/-E come from --barcode-mismatch/--primer-mismatch (set
+in the qsub wrapper); -l/-M/-F are fixed here. Minibar reads the *_minibar
+primer setup file (tail+index only), not the cutadapt one.
+
+Demux QC runs in both modes but means different things: in post mode it
+profiles genuinely raw demultiplexed reads, in pre mode the reads have
+already been through Chopper. The stage is recorded in every QC output.
+Only post mode can report a raw_demuxed count, so pre mode leaves that
+column of read_counts_summary.txt blank rather than filling it with a
+post-filter number.
+
+This script assumes the primer setup files have already been generated
 (via generate_primer_setup.py) before it is invoked. A separate qsub
 wrapper is responsible for module loading, PBS directives, and calling
 this script.
@@ -32,16 +63,25 @@ Usage:
         --primer-file     /path/to/ITS_primer_setup_YYYYMMDD.txt \\
         --minibar-primer-file /path/to/ITS_primer_setup_minibar_YYYYMMDD.txt \\
         --samplesheet     /path/to/its_samplesheet.csv \\
+        [--filter-stage post|pre] \\
         [--chopper /path/to/chopper] \\
         [--minibar  /path/to/minibar.py] \\
         [--cutadapt /path/to/cutadapt] \\
         [--min-quality 15] [--min-length 400] [--max-length 1200] \\
-        [--barcode-mismatch 1] [--primer-mismatch 9]
+        [--barcode-mismatch 1] [--primer-mismatch 9] \\
+        [--minibar-work-dir $PBS_JOBFS] \\
+        [--diagnostic]
+
+    --diagnostic is shorthand for
+        --filter-stage post --min-length 100 --max-length 5000
+    so a first pass observes the real length distribution instead of
+    assuming the 400-1200 bp window.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import gzip
 import os
@@ -49,14 +89,20 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
-# Local import: two-pass cutadapt step (file lives in the same tools/ dir).
+# Local imports: sibling modules in the same tools/ dir.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cutadapt_2pass import run_cutadapt_step, DEFAULT_CUTADAPT  # noqa: E402
+from cutadapt_2pass import (  # noqa: E402
+    CutadaptStats,
+    DEFAULT_CUTADAPT,
+    run_cutadapt_step,
+)
+from demux_qc import SampleQC, run_demux_qc  # noqa: E402
 
 
 # --- Defaults (Gadi) ---------------------------------------------------------
@@ -68,9 +114,15 @@ DEFAULT_MINIBAR = Path("/g/data/vz35/ONT_16s_workflow/tools/minibar/minibar.py")
 # =============================================================================
 # Helpers
 # =============================================================================
+# Step 2 logs from worker threads, and print() emits the message and the
+# newline as two separate writes, so without this the job log interleaves.
+_LOG_LOCK = threading.Lock()
+
+
 def log(msg: str = "") -> None:
     """Flushed print so the PBS job log stays in order."""
-    print(msg, flush=True)
+    with _LOG_LOCK:
+        print(msg, flush=True)
 
 
 def banner(title: str) -> None:
@@ -89,6 +141,21 @@ def count_fastq_reads(path: Path) -> int:
     return lines // 4
 
 
+def fastq_has_reads(path: Path) -> bool:
+    """True if a fastq holds at least one byte of payload, gzipped or plain.
+
+    Chopper writes an output file for every input chunk, including ones where
+    it kept 0 reads. Gzipped, those are valid ~70-byte members with no
+    records, so a size check cannot spot them -- the first decompressed byte
+    has to be read. Minibar indexes the first line of whatever it opens and
+    dies with IndexError on an empty one.
+    """
+    if path.suffix == ".gz":
+        with gzip.open(path, "rb") as fh:
+            return bool(fh.read(1))
+    return path.stat().st_size > 0
+
+
 def sanitise(name: str) -> str:
     """Match the awk gsub(/[^A-Za-z0-9._-]/, "_") used in the bash version."""
     return re.sub(r"[^A-Za-z0-9._-]", "_", name)
@@ -101,8 +168,59 @@ def sanitise_sample_id(sid: str) -> str:
 
 
 # =============================================================================
-# Step 1 - Chopper filtering
+# Chopper filtering
+#
+# Used at two different points depending on --filter-stage:
+#   pre  -> Step 1, whole raw fastq.gz files, before demultiplexing
+#   post -> Step 4, per-sample merged fastq, after demultiplexing and QC
+# Both go through _chopper_stream so the filtering itself is identical.
 # =============================================================================
+def _chopper_stream(
+    chopper_prog: Path,
+    src: BinaryIO,
+    dst: BinaryIO,
+    min_quality: int,
+    min_length: int,
+    max_length: int,
+    what: str,
+) -> None:
+    """
+    Stream src -> chopper -> dst.
+
+    Equivalent to:  cat SRC | chopper -q Q --minlength MIN --maxlength MAX > DST
+    The caller owns src/dst, so it decides whether either side is gzipped.
+    """
+    chopper = subprocess.Popen(
+        [
+            str(chopper_prog),
+            "-q", str(min_quality),
+            "--minlength", str(min_length),
+            "--maxlength", str(max_length),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    assert chopper.stdin is not None and chopper.stdout is not None
+    try:
+        # Feed chopper from a thread while the main thread drains its stdout,
+        # so neither pipe can fill up and deadlock. Small chunks keep whole
+        # fastq files out of memory.
+        def feed() -> None:
+            try:
+                shutil.copyfileobj(src, chopper.stdin, length=1 << 20)
+            finally:
+                chopper.stdin.close()
+
+        t = threading.Thread(target=feed, daemon=True)
+        t.start()
+        shutil.copyfileobj(chopper.stdout, dst, length=1 << 20)
+        t.join()
+    finally:
+        rc = chopper.wait()
+    if rc != 0:
+        sys.exit(f"ERROR: chopper failed on {what} (exit {rc})")
+
+
 def run_chopper(
     raw_input_dir: Path,
     filtered_dir: Path,
@@ -112,10 +230,19 @@ def run_chopper(
     max_length: int,
 ) -> list[Path]:
     """
-    Pipe each fastq.gz through chopper and gzip the result back.
+    Pipe each fastq.gz through chopper, writing plain fastq.
+    Only used by --filter-stage pre.
 
     Equivalent to:
-        zcat IN | chopper -q Q --minlength MIN --maxlength MAX | gzip > OUT
+        zcat IN | chopper -q Q --minlength MIN --maxlength MAX > OUT
+
+    The output is deliberately not gzipped. These files are intermediate --
+    Minibar decompresses them immediately and cleanup() deletes them -- and
+    recompressing cost more than everything else in this step put together:
+    Python's gzip writer defaults to compresslevel=9, which measured ~8 MB/s
+    and throttled chopper itself, for no benefit on a file that is about to
+    be read once and thrown away. The caller puts filtered_dir on jobfs so
+    the larger intermediate never touches /g/data.
     """
     banner("STEP 1: Chopper filtering")
     log(f" Input dir:    {raw_input_dir}")
@@ -130,48 +257,20 @@ def run_chopper(
     outputs: list[Path] = []
     for f in inputs:
         sample = f.name.removesuffix(".fastq.gz")
-        out_file = filtered_dir / f"{sample}_filtered.fastq.gz"
+        out_file = filtered_dir / f"{sample}_filtered.fastq"
 
         log(f"  Filtering: {sample}")
         log(f"    Input:  {f}")
         log(f"    Output: {out_file}")
         log(f"    Start:  {datetime.now():%Y-%m-%d %H:%M:%S}")
 
-        # zcat | chopper | gzip   -- assemble as a process pipeline
-        with gzip.open(f, "rb") as zin, gzip.open(out_file, "wb") as zout:
-            chopper = subprocess.Popen(
-                [
-                    str(chopper_prog),
-                    "-q", str(min_quality),
-                    "--minlength", str(min_length),
-                    "--maxlength", str(max_length),
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+        # zcat | chopper > OUT   -- assemble as a process pipeline
+        with gzip.open(f, "rb") as zin, out_file.open("wb") as fout:
+            _chopper_stream(
+                chopper_prog, zin, fout,
+                min_quality, min_length, max_length,
+                what=str(f),
             )
-
-            # Feed decompressed bytes into chopper, stream chopper stdout to gzip out.
-            # Use small chunks so we don't buffer entire fastq files in memory.
-            assert chopper.stdin is not None and chopper.stdout is not None
-            try:
-                # writer thread substitute: alternate reads from input and writes to chopper
-                # Simpler: use shutil.copyfileobj on each side via a thread.
-                import threading
-
-                def feed():
-                    try:
-                        shutil.copyfileobj(zin, chopper.stdin, length=1 << 20)
-                    finally:
-                        chopper.stdin.close()
-
-                t = threading.Thread(target=feed, daemon=True)
-                t.start()
-                shutil.copyfileobj(chopper.stdout, zout, length=1 << 20)
-                t.join()
-            finally:
-                rc = chopper.wait()
-            if rc != 0:
-                sys.exit(f"ERROR: chopper failed on {f} (exit {rc})")
 
         log(f"    Done:   {datetime.now():%Y-%m-%d %H:%M:%S}")
         log("")
@@ -195,22 +294,181 @@ def count_filtered_total(filtered_files: Iterable[Path]) -> int:
     return total
 
 
+def count_raw_total(raw_files: Iterable[Path]) -> int:
+    """Total reads handed to Minibar in post mode (no pre-filter applied)."""
+    log("")
+    log(f" Counting total raw input reads: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    total = 0
+    for f in raw_files:
+        n = count_fastq_reads(f)
+        log(f"  {f.name}: {n} reads")
+        total += n
+    log(f" Total raw input reads: {total}")
+    log("========================================")
+    return total
+
+
+def run_chopper_per_sample(
+    integrated_dir: Path,
+    chopper_prog: Path,
+    min_quality: int,
+    min_length: int,
+    max_length: int,
+    qc_by_sid: dict[str, SampleQC] | None = None,
+) -> dict[str, tuple[int, int]]:
+    """
+    Post-demux Chopper (--filter-stage post, Step 4).
+
+    Filters each merged sample_<SampleID>.fastq in place. Returns
+    {sample_id: (reads_before, reads_after)} so the demux loss and the
+    filter loss stay separable in the run summary.
+
+    Minibar's catch-all bins (sample_unk, sample_Multiple_Matches) are left
+    unfiltered on purpose: their whole diagnostic value is the unfiltered
+    length profile of what failed to demultiplex.
+
+    Pre-filter counts are taken from the demux QC pass when it has already
+    read the file, so no extra pass over the data is needed.
+    """
+    log("")
+    banner("STEP 4: Chopper filtering (per sample, post-demux)")
+    log(f" Integrated dir: {integrated_dir}")
+    log(f" Filter:         -q {min_quality} --minlength {min_length} "
+        f"--maxlength {max_length}")
+    log("")
+
+    counts: dict[str, tuple[int, int]] = {}
+    sample_fastqs = sorted(integrated_dir.glob("sample_*.fastq"))
+    if not sample_fastqs:
+        log("  WARNING: no sample_*.fastq found; nothing to filter.")
+        log("========================================")
+        return counts
+
+    for fq in sample_fastqs:
+        sid = fq.stem.removeprefix("sample_")
+        if sid in ("unk", "Multiple_Matches"):
+            log(f"  Skipping catch-all bin: {fq.name} (left unfiltered)")
+            continue
+
+        qc = (qc_by_sid or {}).get(sid)
+        before = qc.reads if qc is not None else count_fastq_reads(fq)
+
+        # Deliberately not *.fastq: a crash mid-filter must not leave behind
+        # something the sample_*.fastq globs downstream would pick up.
+        tmp_out = fq.with_name(fq.name + ".chopped.tmp")
+        log(f"  Filtering: {sid}")
+        log(f"    Start:  {datetime.now():%Y-%m-%d %H:%M:%S}")
+        with fq.open("rb") as fin, tmp_out.open("wb") as fout:
+            _chopper_stream(
+                chopper_prog, fin, fout,
+                min_quality, min_length, max_length,
+                what=str(fq),
+            )
+        tmp_out.replace(fq)
+
+        after = count_fastq_reads(fq)
+        counts[sid] = (before, after)
+        pct = (100.0 * after / before) if before else 0.0
+        log(f"    Done:   {before:,} -> {after:,} reads ({pct:.2f}% retained)")
+
+    tot_before = sum(b for b, _ in counts.values())
+    tot_after = sum(a for _, a in counts.values())
+    tot_pct = (100.0 * tot_after / tot_before) if tot_before else 0.0
+    log("")
+    log(f" Per-sample Chopper complete: {tot_before:,} -> {tot_after:,} reads "
+        f"({tot_pct:.2f}% retained) at {datetime.now():%Y-%m-%d %H:%M:%S}")
+    log("========================================")
+    return counts
+
+
 # =============================================================================
-# Step 2 - Minibar demultiplexing
+# Step 2 - Minibar demultiplexing + merge
 # =============================================================================
-def run_minibar(
-    filtered_files: list[Path],
-    output_dir: Path,
+def minibar_chunk_name(input_file: Path) -> str:
+    """Working-directory name for one chunk.
+
+    Strips both suffixes so X.fastq.gz, X_filtered.fastq.gz and the plain
+    X_filtered.fastq that pre mode now writes all give the same stem.
+    """
+    return input_file.name.removesuffix(".gz").removesuffix(".fastq")
+
+
+def _minibar_one(
+    input_file: Path,
+    work_dir: Path,
     primer_file: Path,
     minibar_prog: Path,
-    barcode_mismatch: int = 1,   # NEW — default preserves current behaviour exactly
+    minibar_log_dir: Path,
+    barcode_mismatch: int = 1,
+    primer_mismatch: int = 5,
+) -> tuple[Path, Path, int]:
+    """
+    Demultiplex one chunk in its own subdirectory of work_dir.
+
+    Equivalent to:
+        cd WORKDIR/<base> && python3 minibar.py -e E -E P -l 200 -M 2 -F PRIMER IN
+
+    See run_minibar() for why -e/-E/-M/-l are set the way they are.
+
+    Returns (input_file, outd, returncode). Minibar's own progress output
+    goes to <outd>/minibar.log instead of the job log: several chunks run at
+    once now, and their interleaved stdout was unreadable. A copy is kept in
+    minibar_log_dir, which lives in the output dir, because work_dir is on
+    node-local $PBS_JOBFS and does not outlive the job.
+    """
+    base = minibar_chunk_name(input_file)
+    outd = work_dir / base
+    outd.mkdir(parents=True, exist_ok=True)
+    chunk_log = outd / "minibar.log"
+
+    cmd = [
+        sys.executable, str(minibar_prog),
+        "-e", str(barcode_mismatch),
+        "-E", str(primer_mismatch),
+        "-l", "200",
+        "-M", "2",
+        "-F",
+        str(primer_file),
+        str(input_file),
+    ]
+
+    log(f"  START  {base}  ({datetime.now():%H:%M:%S})  input: {input_file}")
+    # minibar writes per-sample fastqs into its current working directory
+    with chunk_log.open("wb") as logfh:
+        rc = subprocess.call(cmd, cwd=outd,
+                             stdout=logfh, stderr=subprocess.STDOUT)
+    log(f"  DONE   {base}  ({datetime.now():%H:%M:%S})  exit {rc}")
+
+    # Copied now, not at step 7: a non-zero rc aborts the run before
+    # collect_logs() gets a chance, and the jobfs copy would be lost.
+    try:
+        shutil.copyfile(chunk_log, minibar_log_dir / f"{base}.log")
+    except OSError as exc:
+        log(f"  WARNING: could not save {chunk_log}: {exc}")
+
+    return input_file, outd, rc
+
+
+def run_minibar(
+    filtered_files: list[Path],
+    work_dir: Path,
+    primer_file: Path,
+    minibar_prog: Path,
+    minibar_log_dir: Path,
+    max_workers: int | None = None,
+    barcode_mismatch: int = 1,
     primer_mismatch: int = 5,
 ) -> list[Path]:
     """
-    Run minibar on each filtered file in its own subdirectory.
+    Run minibar on every input file, several chunks at a time.
 
-    Equivalent to:
-        cd OUTDIR/<base> && python3 minibar.py -e N -E N -l 200 -M 2 -T -F PRIMER IN
+    Minibar is single-threaded pure Python and the dominant cost of the run,
+    so the chunks are spread across PBS_NCPUS workers. A thread pool is
+    enough because each chunk is a subprocess; the threads only wait on it.
+
+    The returned directories are in input order, so merge_per_file_outputs()
+    concatenates chunks in the same order a serial run did and the merged
+    per-sample fastqs stay byte-identical.
 
     barcode_mismatch sets minibar's -e (allowed edit distance when matching the
     barcode index). The IDT ITS FwIndex set has a minimum pairwise Hamming
@@ -246,48 +504,58 @@ def run_minibar(
     reference (22 bp Illumina tail + 10 bp index), ~52 bp if the full construct
     is used instead — which it is; leaving headroom matters because ONT reads
     often carry a few bases of noise before the adapter starts.
+
+    Post mode feeds Minibar the raw fastq_pass reads, i.e. also the > 1200 bp
+    reads that pre mode would have filtered out first. -M 2 means those reads
+    are still only assigned on a both-ends barcode match, so this changes how
+    many reads Minibar has to scan, not how they are assigned.
     """
     log("")
     banner("STEP 2: Minibar demultiplexing")
+
+    if max_workers is None:
+        max_workers = int(os.environ.get("PBS_NCPUS", "1") or "1")
+    # More workers than chunks would just sit idle, and the pool needs >= 1.
+    workers = max(1, min(max_workers, len(filtered_files)))
+
+    log(f" Work dir: {work_dir}")
+    log(f" Log dir:  {minibar_log_dir}")
+    log(f" Flags:    -e {barcode_mismatch} -E {primer_mismatch} -l 200 -M 2 -F")
+    log(f" Workers:  {workers} (PBS_NCPUS={os.environ.get('PBS_NCPUS', 'unset')}, "
+        f"{len(filtered_files)} chunk(s))")
     log(f" Files found:")
     for f in filtered_files:
         log(f"   {f}")
     log("")
 
-    per_file_dirs: list[Path] = []
-    for input_file in filtered_files:
-        base = input_file.name.removesuffix(".fastq.gz")
-        outd = output_dir / base
-        outd.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    minibar_log_dir.mkdir(parents=True, exist_ok=True)
 
-        log(f"--- Processing: {base} ---")
-        log(f"  Input:  {input_file}")
-        log(f"  Outdir: {outd}")
-        log(f"  Start:  {datetime.now():%Y-%m-%d %H:%M:%S}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        # ex.map yields in input order regardless of completion order.
+        results = list(ex.map(
+            lambda f: _minibar_one(f, work_dir, primer_file, minibar_prog,
+                                   minibar_log_dir, barcode_mismatch,
+                                   primer_mismatch),
+            filtered_files,
+        ))
 
-        cmd = [
-            sys.executable, str(minibar_prog),
-            "-e", str(barcode_mismatch),
-            "-E", str(primer_mismatch),
-            "-l", "200",
-            "-M", "2",
-            "-F",
-            str(primer_file),
-            str(input_file),
-        ]
-        # minibar writes per-sample fastqs into its current working directory
-        log(f"  Cmd:    {' '.join(cmd)}")
-        rc = subprocess.call(cmd, cwd=outd)
-        if rc != 0:
-            sys.exit(f"ERROR: minibar failed on {input_file} (exit {rc})")
-
-        log(f"  Done:   {datetime.now():%Y-%m-%d %H:%M:%S}")
+    # Every chunk is allowed to finish before the run aborts, so one failure
+    # does not hide the others. A non-zero rc is still fatal.
+    failed = [(f, outd, rc) for f, outd, rc in results if rc != 0]
+    if failed:
         log("")
-        per_file_dirs.append(outd)
+        for f, outd, rc in failed:
+            saved = minibar_log_dir / f"{minibar_chunk_name(f)}.log"
+            log(f" ERROR: minibar failed on {f} (exit {rc})")
+            log(f"        log: {saved}")
+        sys.exit(f"ERROR: minibar failed on {len(failed)} of "
+                 f"{len(results)} chunk(s); see the logs above")
 
+    log("")
     log(f" All files demultiplexed: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")
-    return per_file_dirs
+    return [outd for _, outd, _ in results]
 
 
 def merge_per_file_outputs(
@@ -319,7 +587,9 @@ def merge_per_file_outputs(
     log("========================================")
 
 
-def cleanup(per_file_dirs: list[Path], filtered_dir: Path) -> None:
+def cleanup(per_file_dirs: list[Path], filtered_dir: Path | None) -> None:
+    """Remove the per-file Minibar trees, and the Chopper scratch dir if the
+    run made one (post mode has no pre-filter, so filtered_dir is None)."""
     log("")
     banner("Cleaning up per-file subdirectories")
     for d in per_file_dirs:
@@ -327,6 +597,9 @@ def cleanup(per_file_dirs: list[Path], filtered_dir: Path) -> None:
         shutil.rmtree(d, ignore_errors=True)
     log(f" Cleanup complete: {datetime.now():%Y-%m-%d %H:%M:%S}")
     log("========================================")
+
+    if filtered_dir is None:
+        return
 
     log("")
     banner("Deleting Chopper filtered files")
@@ -337,7 +610,7 @@ def cleanup(per_file_dirs: list[Path], filtered_dir: Path) -> None:
 
 
 # =============================================================================
-# Step 3 - Organise by client + summaries
+# Step 6 - Organise by client + summaries
 # =============================================================================
 @dataclass
 class ClientSample:
@@ -387,7 +660,7 @@ def organise_by_client(
     samples: list[ClientSample],
 ) -> None:
     log("")
-    banner("STEP 3: Organising reads by client")
+    banner("STEP 6: Organising reads by client")
 
     for cs in samples:
         client_dir = integrated_dir / cs.client
@@ -466,16 +739,50 @@ def organise_by_client(
     log("========================================")
 
 
+# Column widths for the extended read count table.
+_W = {
+    "sample": 40, "reads": 10, "pct_input": 10, "raw_demuxed": 12,
+    "post_chopper": 13, "pct_retained": 13, "pass1": 20, "pct_pass1": 15,
+}
+_TABLE_WIDTH = sum(_W.values()) + len(_W) - 1
+
+
 def write_run_summary(
     integrated_dir: Path,
     summary_file: Path,
     raw_input_dir: Path,
-    filtered_dir: Path,
+    filtered_dir: Path | None,
     output_dir: Path,
     total_input: int,
+    filter_stage: str,
+    qc_by_sid: dict[str, SampleQC] | None = None,
+    chopper_by_sid: dict[str, tuple[int, int]] | None = None,
+    cutadapt_by_sid: dict[str, CutadaptStats] | None = None,
 ) -> None:
+    """
+    Write read_counts_summary.txt.
+
+    Beyond the legacy Reads / % of Input columns this tracks the read count
+    through each stage:
+
+        raw_demuxed -> post_chopper -> pct_retained
+                    -> post_cutadapt_pass1 -> pct_pass1_kept
+
+    pct_pass1_kept is the non-specificity signal. A barcode with a healthy
+    raw_demuxed but a low pct_pass1_kept means Minibar found the right
+    barcode on reads that are not the expected product -- correct barcode,
+    wrong amplicon -- which a post_chopper count alone would hide.
+
+    In --filter-stage pre the reads were filtered before demultiplexing, so
+    no raw_demuxed count exists; that column and pct_retained are left blank
+    rather than being filled with a post-filter number.
+    """
     log("")
     banner("Generating read count summary")
+
+    qc_by_sid = qc_by_sid or {}
+    chopper_by_sid = chopper_by_sid or {}
+    cutadapt_by_sid = cutadapt_by_sid or {}
 
     # collect all per-sample fastqs (top-level + one client level deep).
     # Cutadapt step renames sample_<id>.fastq -> <id>.fastq.gz; the minibar
@@ -486,28 +793,90 @@ def write_run_summary(
     fastqs += sorted(integrated_dir.glob("*.fastq.gz"))
     fastqs += sorted(integrated_dir.glob("*/*.fastq.gz"))
 
+    input_label = ("TOTAL RAW INPUT" if filter_stage == "post"
+                   else "TOTAL FILTERED INPUT")
+    sep = "-" * _TABLE_WIDTH
+
     lines = [
         "========================================",
         " Minibar Demultiplexing Read Count Summary",
         f" Raw input dir:     {raw_input_dir}",
-        f" Filtered dir:      {filtered_dir}",
+        f" Filtered dir:      {filtered_dir if filtered_dir else '<none: post-demux filtering>'}",
         f" Out dir:           {output_dir}",
+        f" Filter stage:      {filter_stage}",
         f" Date:              {datetime.now():%Y-%m-%d %H:%M:%S}",
         "========================================",
-        f"{'Sample':<40} {'Reads':>10} {'% of Input':>10}",
-        "----------------------------------------",
+        (
+            f"{'Sample':<{_W['sample']}} {'Reads':>{_W['reads']}} "
+            f"{'% of Input':>{_W['pct_input']}} {'raw_demuxed':>{_W['raw_demuxed']}} "
+            f"{'post_chopper':>{_W['post_chopper']}} {'pct_retained':>{_W['pct_retained']}} "
+            f"{'post_cutadapt_pass1':>{_W['pass1']}} {'pct_pass1_kept':>{_W['pct_pass1']}}"
+        ),
+        sep,
     ]
+
+    def fmt(value: int | None, width: int) -> str:
+        """Blank rather than 0 when a stage genuinely has no number."""
+        return f"{'':>{width}}" if value is None else f"{value:>{width},}"
+
+    def fmt_pct(value: float | None, width: int) -> str:
+        return f"{'':>{width}}" if value is None else f"{value:>{width - 1}.2f}%"
 
     total_demux = 0
     multi_match_reads = 0
     unk_reads = 0
+    # tot_raw is the column total (every bin). tot_raw_chopped is the subset
+    # that actually went through Chopper, and is the only honest denominator
+    # for the TOTAL pct_retained -- the catch-all bins are left unfiltered.
+    tot_raw = tot_raw_chopped = tot_chop = tot_pass1 = tot_pass1_in = 0
     for f in fastqs:
         # .fastq.gz files have suffixes ".fastq" + ".gz"; .stem strips only ".gz".
         sample = f.name.removesuffix(".fastq.gz") if f.name.endswith(".fastq.gz") else f.stem
         reads = count_fastq_reads(f)
         pct = (reads / total_input * 100) if total_input else 0.0
-        lines.append(f"{sample:<40} {reads:>10d} {pct:>9.2f}%")
+
+        # Sample ID as the QC/chopper/cutadapt maps key it (no sample_ prefix).
+        sid = sample.removeprefix("sample_")
+        chop = chopper_by_sid.get(sid)
+        cut = cutadapt_by_sid.get(sid)
+
+        if filter_stage == "post":
+            raw_demuxed = chop[0] if chop else (
+                qc_by_sid[sid].reads if sid in qc_by_sid else None
+            )
+            post_chopper = chop[1] if chop else None
+        else:
+            # No raw demuxed count exists in pre mode -- reads were already
+            # filtered when Minibar saw them.
+            raw_demuxed = None
+            post_chopper = qc_by_sid[sid].reads if sid in qc_by_sid else None
+
+        pct_retained = (
+            100.0 * post_chopper / raw_demuxed
+            if raw_demuxed and post_chopper is not None else None
+        )
+        pass1 = cut.pass1_kept if cut and not cut.error else None
+        pct_pass1 = (
+            100.0 * cut.pass1_kept / cut.input_reads
+            if cut and not cut.error and cut.input_reads else None
+        )
+
+        lines.append(
+            f"{sample:<{_W['sample']}} {reads:>{_W['reads']},} "
+            f"{pct:>{_W['pct_input'] - 1}.2f}% {fmt(raw_demuxed, _W['raw_demuxed'])} "
+            f"{fmt(post_chopper, _W['post_chopper'])} "
+            f"{fmt_pct(pct_retained, _W['pct_retained'])} "
+            f"{fmt(pass1, _W['pass1'])} {fmt_pct(pct_pass1, _W['pct_pass1'])}"
+        )
+
         total_demux += reads
+        tot_raw += raw_demuxed or 0
+        tot_chop += post_chopper or 0
+        if raw_demuxed and post_chopper is not None:
+            tot_raw_chopped += raw_demuxed
+        if cut and not cut.error:
+            tot_pass1 += cut.pass1_kept
+            tot_pass1_in += cut.input_reads
         if sample == "sample_Multiple_Matches":
             multi_match_reads = reads
         elif sample == "sample_unk":
@@ -517,13 +886,51 @@ def write_run_summary(
     success_pct = (success_reads / total_input * 100) if total_input else 0.0
     total_pct = (total_demux / total_input * 100) if total_input else 0.0
 
+    tot_raw_disp = tot_raw if filter_stage == "post" and tot_raw else None
+    tot_chop_disp = tot_chop or None
+    tot_retained = (
+        100.0 * tot_chop / tot_raw_chopped if tot_raw_chopped and tot_chop else None
+    )
+    tot_pass1_disp = tot_pass1 or None
+    tot_pct_pass1 = (100.0 * tot_pass1 / tot_pass1_in) if tot_pass1_in else None
+
     lines += [
-        "----------------------------------------",
-        f"{'TOTAL DEMULTIPLEXED':<40} {total_demux:>10d} {total_pct:>9.2f}%",
-        f"{'SUCCESSFULLY DEMULTIPLEXED':<40} {success_reads:>10d} {success_pct:>9.2f}%",
-        f"{'TOTAL FILTERED INPUT':<40} {total_input:>10d} {100.00:>9.2f}%",
-        "========================================",
+        sep,
+        (
+            f"{'TOTAL DEMULTIPLEXED':<{_W['sample']}} {total_demux:>{_W['reads']},} "
+            f"{total_pct:>{_W['pct_input'] - 1}.2f}% {fmt(tot_raw_disp, _W['raw_demuxed'])} "
+            f"{fmt(tot_chop_disp, _W['post_chopper'])} "
+            f"{fmt_pct(tot_retained, _W['pct_retained'])} "
+            f"{fmt(tot_pass1_disp, _W['pass1'])} "
+            f"{fmt_pct(tot_pct_pass1, _W['pct_pass1'])}"
+        ),
+        f"{'SUCCESSFULLY DEMULTIPLEXED':<{_W['sample']}} {success_reads:>{_W['reads']},} "
+        f"{success_pct:>{_W['pct_input'] - 1}.2f}%",
+        f"{input_label:<{_W['sample']}} {total_input:>{_W['reads']},} "
+        f"{100.00:>{_W['pct_input'] - 1}.2f}%",
+        "=" * _TABLE_WIDTH,
+        "",
+        " Columns:",
+        "   Reads                final read count in the delivered fastq",
+        f"   % of Input           share of {input_label.lower()}",
+        "   raw_demuxed          reads Minibar assigned, before filtering"
+        + ("" if filter_stage == "post"
+           else " (n/a: filtered pre-demux)"),
+        "   post_chopper         reads surviving the Chopper length/Q filter",
+        "   pct_retained         post_chopper / raw_demuxed",
+        "   post_cutadapt_pass1  reads with a findable forward primer",
+        "   pct_pass1_kept       post_cutadapt_pass1 / cutadapt input;",
+        "                        low here with a healthy raw_demuxed means",
+        "                        correct barcode, wrong product",
     ]
+    if filter_stage == "post":
+        lines += [
+            "",
+            " Note: sample_unk and sample_Multiple_Matches are left unfiltered --",
+            "       their raw length profile is what makes them diagnostic. They",
+            "       are therefore excluded from the TOTAL pct_retained denominator.",
+        ]
+    lines.append("=" * _TABLE_WIDTH)
 
     body = "\n".join(lines)
     log(body)
@@ -554,16 +961,47 @@ def parse_args() -> argparse.Namespace:
                         "this; if omitted it falls back to --primer-file.")
     p.add_argument("--samplesheet", type=Path, required=True,
                    help="Sample sheet CSV (Client, Sample_ID, Barcode).")
+    # default None (not "post") so an explicit --filter-stage pre can be told
+    # apart from an unset one when --diagnostic is also given.
+    p.add_argument("--filter-stage", choices=("pre", "post"), default=None,
+                   help="Run Chopper after demultiplexing, per sample (post, "
+                        "default) or before it (pre, legacy ordering). "
+                        "In post mode raw fastq_pass files go straight to "
+                        "Minibar with no pre-filter at all.")
+    p.add_argument("--minibar-work-dir", type=Path, default=None,
+                   help="Where Minibar's per-file working directories are "
+                        "created (default: the output dir). Point this at "
+                        "$PBS_JOBFS in post mode -- unfiltered input makes "
+                        "these trees several times larger, and only the "
+                        "merged result needs to reach the output dir.")
     p.add_argument("--chopper", type=Path, default=DEFAULT_CHOPPER,
                    help=f"Path to chopper binary (default: {DEFAULT_CHOPPER}).")
     p.add_argument("--minibar", type=Path, default=DEFAULT_MINIBAR,
                    help=f"Path to minibar.py (default: {DEFAULT_MINIBAR}).")
-    p.add_argument("--min-quality", type=int, default=15)
+
+    # Chopper filter parameters. --min-length/--max-length are what the qsub
+    # wrapper passes; --minlength/--maxlength (chopper's own flag names) are
+    # accepted as aliases, matching the 16S workflow.
     # Length window depends on the primer pair — override per run from the
     # qsub wrapper. Defaults suit ITS (main peak ~0.78-0.80 kb, shoulder
     # ~0.60-0.70 kb; concatemers/junk above ~1.5 kb).
-    p.add_argument("--min-length", type=int, default=400)
-    p.add_argument("--max-length", type=int, default=1200)
+    p.add_argument("--min-quality", "-q", type=int, default=None,
+                   help="Chopper -q minimum mean read quality (default: 15).")
+    p.add_argument("--min-length", "--minlength", dest="minlength",
+                   type=int, default=None,
+                   help="Chopper --minlength (default: 400).")
+    p.add_argument("--max-length", "--maxlength", dest="maxlength",
+                   type=int, default=None,
+                   help="Chopper --maxlength (default: 1200).")
+
+    p.add_argument("--diagnostic", action="store_true",
+                   help="Shorthand for --filter-stage post --min-length 100 "
+                        "--max-length 5000, so a first pass observes the real "
+                        "length distribution instead of assuming the window. "
+                        "Explicitly given flags still win.")
+    p.add_argument("--no-demux-qc", action="store_true",
+                   help="Skip the per-sample demux QC pass (Step 3).")
+
     # minibar -e: allowed edit distance for barcode-index matching. Raising it
     # above 1 can rescue unk reads but also grows Multiple_Matches, since the IDT
     # ITS FwIndex set has a minimum pairwise Hamming distance of 3.
@@ -574,19 +1012,61 @@ def parse_args() -> argparse.Namespace:
                    help="minibar -e barcode index edit distance (default: 1).")
     p.add_argument("--primer-mismatch", type=int, default=5,
                    help="minibar -E primer edit distance (default: 5; wrapper passes 9).")
+
     p.add_argument("--cutadapt", type=Path, default=DEFAULT_CUTADAPT,
                    help=f"Path to cutadapt binary (default: {DEFAULT_CUTADAPT}).")
     p.add_argument("--cutadapt-threads", type=int, default=4,
                    help="Threads for cutadapt (default: 4).")
     p.add_argument("--cutadapt-error-rate", type=float, default=0.2,
                    help="Cutadapt error rate -e (default: 0.2).")
-    return p.parse_args()
+
+    args = p.parse_args()
+    _resolve_filter_settings(args, p)
+    return args
+
+
+# Standard filter window (ITS), and the wide window --diagnostic swaps in.
+_DEFAULTS = {"min_quality": 15, "minlength": 400, "maxlength": 1200}
+_DIAGNOSTIC = {"filter_stage": "post", "minlength": 100, "maxlength": 5000}
+
+
+def _resolve_filter_settings(args: argparse.Namespace,
+                             parser: argparse.ArgumentParser) -> None:
+    """
+    Apply precedence: explicit flag > --diagnostic > default.
+
+    The filter args default to None so an explicitly passed value is
+    distinguishable from an unset one, which is what lets --diagnostic
+    supply values without silently overriding the user.
+    """
+    if args.diagnostic:
+        if args.filter_stage == "pre":
+            parser.error(
+                "--diagnostic implies --filter-stage post, but "
+                "--filter-stage pre was given explicitly"
+            )
+        args.filter_stage = _DIAGNOSTIC["filter_stage"]
+        for key in ("minlength", "maxlength"):
+            if getattr(args, key) is None:
+                setattr(args, key, _DIAGNOSTIC[key])
+
+    if args.filter_stage is None:
+        args.filter_stage = "post"
+
+    for key, value in _DEFAULTS.items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+
+    if args.minlength > args.maxlength:
+        parser.error(
+            f"--min-length ({args.minlength}) exceeds --max-length ({args.maxlength})"
+        )
 
 
 def collect_logs(output_dir: Path) -> Path:
     """Move all *.log and *.txt summaries into a dated run_log_<date> directory."""
     log("")
-    banner("Collecting logs")
+    banner("STEP 7: Collecting logs")
     date_stamp = datetime.now().strftime("%Y%m%d")
     log_dir = output_dir / f"run_log_{date_stamp}"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -601,18 +1081,22 @@ def collect_logs(output_dir: Path) -> Path:
                 moved += 1
                 log(f"  Moved: {src.name}")
 
-    # Cutadapt per-sample logs live in output_dir/cutadapt_logs/
-    cutadapt_logs = output_dir / "cutadapt_logs"
-    if cutadapt_logs.is_dir():
-        dest = log_dir / cutadapt_logs.name
-        # If a previous run already populated run_log_<date>/cutadapt_logs/, merge
+    # Per-sample cutadapt logs and per-chunk minibar logs live in their own
+    # subdirectories of output_dir. The minibar ones were copied off jobfs by
+    # run_minibar(), which is why they survive cleanup() having run.
+    for name in ("cutadapt_logs", "minibar_logs"):
+        src_dir = output_dir / name
+        if not src_dir.is_dir():
+            continue
+        dest = log_dir / name
+        # If a previous run already populated run_log_<date>/<name>/, merge
         if dest.exists():
-            for f in cutadapt_logs.iterdir():
+            for f in src_dir.iterdir():
                 shutil.move(str(f), str(dest / f.name))
-            cutadapt_logs.rmdir()
+            src_dir.rmdir()
         else:
-            shutil.move(str(cutadapt_logs), str(dest))
-        log(f"  Moved: cutadapt_logs/ -> {log_dir.name}/cutadapt_logs/")
+            shutil.move(str(src_dir), str(dest))
+        log(f"  Moved: {name}/ -> {log_dir.name}/{name}/")
         moved += 1
 
     log(f" Collected {moved} log items into {log_dir}")
@@ -640,34 +1124,116 @@ def main() -> None:
         sys.exit(f"ERROR: cutadapt not found: {args.cutadapt}")
 
     output_dir = args.output_dir
-    filtered_dir = output_dir / "chopper_filtered"
     integrated_dir = output_dir / "integrated_demultiplexing"
+    qc_dir = output_dir / "demux_qc"
     summary_file = output_dir / "read_counts_summary.txt"
+    # Minibar's per-chunk trees are bulky and purely intermediate, so they go
+    # to node-local jobfs in both modes; only the merged result reaches
+    # output_dir. An explicit --minibar-work-dir still wins.
+    if args.minibar_work_dir is not None:
+        minibar_work_dir = args.minibar_work_dir
+    elif os.environ.get("PBS_JOBFS"):
+        minibar_work_dir = Path(os.environ["PBS_JOBFS"]) / "minibar_work"
+    else:
+        minibar_work_dir = output_dir
+    minibar_log_dir = output_dir / "minibar_logs"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     integrated_dir.mkdir(parents=True, exist_ok=True)
 
     log(f" Primer file (cutadapt): {args.primer_file}")
     log(f" Primer file (minibar):  {minibar_primer_file}")
+    log(f" Filter stage: {args.filter_stage}")
+    if args.minibar_work_dir is None and not os.environ.get("PBS_JOBFS"):
+        log(f" WARNING: PBS_JOBFS unset; Minibar working dirs go to "
+            f"{minibar_work_dir}")
+    log(f" Chopper:      -q {args.min_quality} --minlength {args.minlength} "
+        f"--maxlength {args.maxlength}"
+        + ("   [--diagnostic]" if args.diagnostic else ""))
 
-    # ---- Step 1 ----
-    filtered = run_chopper(
-        args.raw_input_dir, filtered_dir, args.chopper,
-        args.min_quality, args.min_length, args.max_length,
-    )
-    total_input = count_filtered_total(filtered)
+    # ---- Step 1: Chopper, pre-demux only ----
+    if args.filter_stage == "pre":
+        # Intermediate and uncompressed, so it goes to node-local jobfs
+        # alongside the Minibar work dirs rather than onto /g/data.
+        filtered_dir = (Path(os.environ["PBS_JOBFS"])
+                        if os.environ.get("PBS_JOBFS")
+                        else output_dir) / "chopper_filtered"
+        minibar_inputs = run_chopper(
+            args.raw_input_dir, filtered_dir, args.chopper,
+            args.min_quality, args.minlength, args.maxlength,
+        )
+        total_input = count_filtered_total(minibar_inputs)
+    else:
+        # No pre-filter: fastq_pass is already MinKNOW min-qscore filtered,
+        # and the whole point of post mode is to let Minibar see everything.
+        filtered_dir = None
+        minibar_inputs = sorted(args.raw_input_dir.glob("*.fastq.gz"))
+        if not minibar_inputs:
+            sys.exit(f"ERROR: no *.fastq.gz files found in {args.raw_input_dir}")
+        log("")
+        banner("STEP 1: Chopper filtering SKIPPED (--filter-stage post)")
+        log(f" Feeding {len(minibar_inputs)} raw file(s) straight to Minibar.")
+        log("========================================")
+        total_input = count_raw_total(minibar_inputs)
 
-    # ---- Step 2 ----
+    # Drop record-less inputs before minibar sees them. total_input is already
+    # counted above and these contribute 0 reads, so the totals do not move.
+    non_empty = []
+    for f in minibar_inputs:
+        if fastq_has_reads(f):
+            non_empty.append(f)
+        else:
+            log(f" SKIP (0 reads): {f.name}")
+    if not non_empty:
+        sys.exit("ERROR: every input fastq is empty -- nothing to "
+                 f"demultiplex (checked {len(minibar_inputs)} file(s))")
+    minibar_inputs = non_empty
+
+    # ---- Step 2: Minibar ----
     per_file_dirs = run_minibar(
-        filtered, output_dir, minibar_primer_file, args.minibar,
+        minibar_inputs, minibar_work_dir, minibar_primer_file, args.minibar,
+        minibar_log_dir,
         barcode_mismatch=args.barcode_mismatch,
         primer_mismatch=args.primer_mismatch,
     )
     merge_per_file_outputs(per_file_dirs, integrated_dir)
     cleanup(per_file_dirs, filtered_dir)
 
-    # ---- Step 2.5: two-pass cutadapt ----
-    run_cutadapt_step(
+    # ---- Step 3: per-sample QC of the demultiplexed reads ----
+    # In post mode this is the only place the pre-filter distribution is
+    # observable, so it has to run before Step 4 touches the files.
+    qc_by_sid: dict[str, SampleQC] = {}
+    if not args.no_demux_qc:
+        qc_by_sid = run_demux_qc(
+            integrated_dir=integrated_dir,
+            qc_dir=qc_dir,
+            minlength=args.minlength,
+            maxlength=args.maxlength,
+            filter_stage=args.filter_stage,
+            log=log,
+        )
+
+    # ---- Step 4: Chopper per sample, post-demux only ----
+    chopper_by_sid: dict[str, tuple[int, int]] = {}
+    if args.filter_stage == "post":
+        chopper_by_sid = run_chopper_per_sample(
+            integrated_dir=integrated_dir,
+            chopper_prog=args.chopper,
+            min_quality=args.min_quality,
+            min_length=args.minlength,
+            max_length=args.maxlength,
+            qc_by_sid=qc_by_sid,
+        )
+    else:
+        # Announced rather than silently absent, so the step numbering lines
+        # up when a pre log and a post log are read side by side.
+        log("")
+        banner("STEP 4: Per-sample Chopper SKIPPED (--filter-stage pre)")
+        log(" Chopper already ran at step 1, before demultiplexing.")
+        log("========================================")
+
+    # ---- Step 5: two-pass cutadapt ----
+    _, cutadapt_stats = run_cutadapt_step(
         integrated_dir=integrated_dir,
         primer_file=args.primer_file,
         output_dir=output_dir,
@@ -675,17 +1241,22 @@ def main() -> None:
         threads=args.cutadapt_threads,
         error_rate=args.cutadapt_error_rate,
     )
+    cutadapt_by_sid = {s.sample_id: s for s in cutadapt_stats}
 
-    # ---- Step 3 ----
+    # ---- Step 6 ----
     samples = load_client_map(args.samplesheet)
     organise_by_client(integrated_dir, samples)
     write_run_summary(
         integrated_dir, summary_file,
         args.raw_input_dir, filtered_dir, output_dir,
         total_input,
+        filter_stage=args.filter_stage,
+        qc_by_sid=qc_by_sid,
+        chopper_by_sid=chopper_by_sid,
+        cutadapt_by_sid=cutadapt_by_sid,
     )
 
-    # ---- Final: gather logs into run_log_<date>/ ----
+    # ---- Step 7: gather logs into run_log_<date>/ ----
     collect_logs(output_dir)
 
 

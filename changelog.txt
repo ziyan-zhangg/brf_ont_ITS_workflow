@@ -1,3 +1,21 @@
+v1.02
+Date: 2026-10-15
+* Change: filter_stage default is now post (demultiplex raw fastq_pass first, then
+  Chopper per sample); pre kept as the legacy ordering. Step numbering follows the
+  16S workflow v6.00 (steps 1-7). Minibar runs chunks in parallel on $PBS_JOBFS;
+  flags unchanged (-e 1 -E 9 from run_script.qsub, -l 200 -M 2 -F fixed).
+  PBS resources raised to ncpus=16, mem=64GB, jobfs=200GB, walltime=8h (from 16S
+  v6.00; confirm on the first ITS post-mode run).
+* Add: per-sample demux QC (demux_qc.py) and extended read_counts_summary.txt
+  (raw_demuxed, post_chopper, pct_retained, post_cutadapt_pass1, pct_pass1_kept).
+* Add: per-sample QC report ported from the 16S workflow (qc_report.py,
+  qc_report_template.html, qc_config.yaml 1.0-its, run_qc_report.qsub,
+  tests/test_qc_report.py). Runs at the end of run_script.qsub (run_qc_report=1).
+  qc_report.py is assay-neutral: title, plot range and "> N kb" labels come from
+  the config; metrics can be info_only. For ITS, modal_dev_bp is info_only.
+  Thresholds are provisional until calibrated on fungal mock / positive controls.
+* Requires: shared venv /g/data/vz35/ONT_16s_workflow/tools/qc_env (PyYAML, matplotlib).
+
 v1.01
 Date: 2026-08-31
 * Update: fix reference bug and allow filexibility for external dependencies
